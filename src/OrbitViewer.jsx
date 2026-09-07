@@ -1,5 +1,23 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import * as THREE from "three";
+import SpaceGame from "./SpaceGame.jsx";
+import {
+  EARTH_RADIUS_KM, MU_EARTH, EARTH_TEXTURE_LON_OFFSET_DEG, GS_ELEVATION_MASK_DEG,
+  kmToScene, keplerToECI, precomputeOrbitPath, stateVectorToElements,
+  eciToLatLon, mjdToISO, fmtDuration, gmstRadians, numOr,
+  groundStationEci, elevationDeg,
+  latLonToMercatorPx, mercatorNormYToLat, getSubsolarPoint, terminatorLatAtLon, groundCoveragePoints,
+  getSunEci, getMoonEci,
+} from "./lib/orbital.js";
+import {
+  buildEarthTexture, loadEarthTextures, buildStarfield, buildSatModel,
+  latLonToVector3, makeAxisLabel, buildAxesTriad, makeLabelTexture, orientFlatOnSphere,
+  COUNTRIES_GEOJSON_URL, buildCountryBoundaries,
+} from "./three/builders.js";
+import { btnStyle, useIsMobile } from "./lib/ui.js";
+import { COSMOS_WEB_VERSION, COSMOS_BRIDGE_VERSION, VIEW_TABS } from "./lib/mission.js";
+import MissionConfigurator from "./views/MissionConfigurator.jsx";
+import GroundStationsView from "./views/GroundStationsView.jsx";
 
 /**
  * Cosmos Engine — Orbit Viewer
@@ -31,398 +49,11 @@ import * as THREE from "three";
  * Keplerian propagator so the visualization is usable standalone.
  */
 
-const EARTH_RADIUS_KM = 6371;
-const MU_EARTH = 398600.4418; // km^3/s^2
-const SCENE_UNITS_PER_KM = 1 / 1000; // 1 scene unit = 1000 km
-
-function kmToScene(km) {
-  return km * SCENE_UNITS_PER_KM;
-}
-
-// ---- Two-body Keplerian propagator -----------------------------------------
-function solveKepler(M, e) {
-  let E = M;
-  for (let i = 0; i < 12; i++) {
-    E = E - (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
-  }
-  return E;
-}
-
-function keplerToECI(elements, tSec) {
-  const { aKm, e, incDeg, raanDeg, argpDeg, epochM } = elements;
-  const inc = (incDeg * Math.PI) / 180;
-  const raan = (raanDeg * Math.PI) / 180;
-  const argp = (argpDeg * Math.PI) / 180;
-
-  const n = Math.sqrt(MU_EARTH / (aKm * aKm * aKm)); // mean motion rad/s
-  const M = epochM + n * tSec;
-  const E = solveKepler(M % (2 * Math.PI), e);
-
-  const xOrb = aKm * (Math.cos(E) - e);
-  const yOrb = aKm * Math.sqrt(1 - e * e) * Math.sin(E);
-  const rMag = aKm * (1 - e * Math.cos(E));
-  const vFactor = Math.sqrt(MU_EARTH * aKm) / rMag;
-  const vxOrb = -vFactor * Math.sin(E);
-  const vyOrb = vFactor * Math.sqrt(1 - e * e) * Math.cos(E);
-
-  const cosO = Math.cos(raan), sinO = Math.sin(raan);
-  const cosI = Math.cos(inc), sinI = Math.sin(inc);
-  const cosW = Math.cos(argp), sinW = Math.sin(argp);
-
-  const r11 = cosO * cosW - sinO * sinW * cosI;
-  const r12 = -cosO * sinW - sinO * cosW * cosI;
-  const r21 = sinO * cosW + cosO * sinW * cosI;
-  const r22 = -sinO * sinW + cosO * cosW * cosI;
-  const r31 = sinW * sinI;
-  const r32 = cosW * sinI;
-
-  const x = r11 * xOrb + r12 * yOrb;
-  const y = r21 * xOrb + r22 * yOrb;
-  const z = r31 * xOrb + r32 * yOrb;
-  const vx = r11 * vxOrb + r12 * vyOrb;
-  const vy = r21 * vxOrb + r22 * vyOrb;
-  const vz = r31 * vxOrb + r32 * vyOrb;
-
-  return { x, y, z, vx, vy, vz, rMag };
-}
-
-function precomputeOrbitPath(elements, segments = 256) {
-  const pts = [];
-  const n = Math.sqrt(MU_EARTH / Math.pow(elements.aKm, 3));
-  const period = (2 * Math.PI) / n;
-  for (let i = 0; i <= segments; i++) {
-    const t = (period * i) / segments;
-    const { x, y, z } = keplerToECI(elements, t);
-    pts.push(new THREE.Vector3(kmToScene(x), kmToScene(z), -kmToScene(y)));
-  }
-  return { pts, period };
-}
-
-// ---- Procedural earth texture (no external asset dependency) --------------
-function buildEarthTexture() {
-  const w = 1024, h = 512;
-  const canvas = document.createElement("canvas");
-  canvas.width = w; canvas.height = h;
-  const ctx = canvas.getContext("2d");
-
-  const ocean = ctx.createLinearGradient(0, 0, 0, h);
-  ocean.addColorStop(0, "#08243f");
-  ocean.addColorStop(0.5, "#0b3358");
-  ocean.addColorStop(1, "#08243f");
-  ctx.fillStyle = ocean;
-  ctx.fillRect(0, 0, w, h);
-
-  // pseudo-random continents via layered blobs (seeded)
-  let seed = 1337;
-  const rand = () => {
-    seed = (seed * 9301 + 49297) % 233280;
-    return seed / 233280;
-  };
-  ctx.fillStyle = "#1c5c3a";
-  for (let i = 0; i < 46; i++) {
-    const cx = rand() * w, cy = rand() * h;
-    const rx = 30 + rand() * 90, ry = 18 + rand() * 50;
-    ctx.beginPath();
-    ctx.ellipse(cx, cy, rx, ry, rand() * Math.PI, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.fillStyle = "#2a6b46";
-  for (let i = 0; i < 60; i++) {
-    const cx = rand() * w, cy = rand() * h;
-    const r = 6 + rand() * 20;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // lat/lon grid
-  ctx.strokeStyle = "rgba(140,200,255,0.18)";
-  ctx.lineWidth = 1;
-  for (let lon = 0; lon <= w; lon += w / 12) {
-    ctx.beginPath(); ctx.moveTo(lon, 0); ctx.lineTo(lon, h); ctx.stroke();
-  }
-  for (let lat = 0; lat <= h; lat += h / 6) {
-    ctx.beginPath(); ctx.moveTo(0, lat); ctx.lineTo(w, lat); ctx.stroke();
-  }
-  ctx.strokeStyle = "rgba(140,200,255,0.4)";
-  ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = THREE.RepeatWrapping;
-  return tex;
-}
-
-// Real Earth imagery (three.js's own hosted example textures — public, CORS-enabled).
-// Falls back to the procedural texture above if a network fetch fails.
-const EARTH_TEXTURE_URLS = {
-  map: "https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg",
-  bump: "https://threejs.org/examples/textures/planets/earth_normal_2048.jpg",
-  specular: "https://threejs.org/examples/textures/planets/earth_specular_2048.jpg",
-  clouds: "https://threejs.org/examples/textures/planets/earth_clouds_1024.png",
-};
-
-function loadEarthTextures(onReady) {
-  const loader = new THREE.TextureLoader();
-  loader.crossOrigin = "anonymous";
-  const result = {};
-  let pending = 3; // map, bump/normal, specular are required; clouds is a bonus layer
-  const done = () => { if (--pending === 0) onReady(result); };
-
-  loader.load(EARTH_TEXTURE_URLS.map, (t) => { result.map = t; done(); }, undefined, done);
-  loader.load(EARTH_TEXTURE_URLS.bump, (t) => { result.normalMap = t; done(); }, undefined, done);
-  loader.load(EARTH_TEXTURE_URLS.specular, (t) => { result.specularMap = t; done(); }, undefined, done);
-  loader.load(EARTH_TEXTURE_URLS.clouds, (t) => { result.clouds = t; }, undefined, () => {});
-}
-
-function buildStarfield(count = 2400) {
-  const positions = new Float32Array(count * 3);
-  for (let i = 0; i < count; i++) {
-    const r = 400 + Math.random() * 300;
-    const theta = Math.random() * Math.PI * 2;
-    const phi = Math.acos(2 * Math.random() - 1);
-    positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
-    positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
-    positions[i * 3 + 2] = r * Math.cos(phi);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  const mat = new THREE.PointsMaterial({ color: 0x9fc6ff, size: 0.6, sizeAttenuation: true });
-  return new THREE.Points(geo, mat);
-}
-
-// Convert an ECI position (km) + MJD to geodetic lat/lon (degrees).
-function eciToLatLon(xKm, yKm, zKm, mjd) {
-  const theta = gmstRadians(mjd);
-  const xe = xKm * Math.cos(theta) + yKm * Math.sin(theta);
-  const ye = -xKm * Math.sin(theta) + yKm * Math.cos(theta);
-  const lon = (Math.atan2(ye, xe) * 180) / Math.PI;
-  const rxy = Math.sqrt(xe * xe + ye * ye);
-  const lat = (Math.atan2(zKm, rxy) * 180) / Math.PI;
-  return { lat, lon };
-}
-
-// Convert an instantaneous state vector (r in km, v in km/s) into the same
-// osculating-Keplerian-element shape keplerToECI()/precomputeOrbitPath()
-// expect, so "future trajectory" can be drawn from live telemetry the same
-// way the simulated-mode preview ellipse is drawn from slider values. This
-// is a standard two-body (Keplerian) fit to the current state — it won't
-// capture perturbations, but is accurate for a near-term forward prediction.
-function stateVectorToElements(rKm, vKmS) {
-  const [rx, ry, rz] = rKm;
-  const [vx, vy, vz] = vKmS;
-  const rMag = Math.sqrt(rx * rx + ry * ry + rz * rz);
-  const vMag = Math.sqrt(vx * vx + vy * vy + vz * vz);
-
-  const hx = ry * vz - rz * vy, hy = rz * vx - rx * vz, hz = rx * vy - ry * vx;
-  const hMag = Math.sqrt(hx * hx + hy * hy + hz * hz);
-
-  const nx = -hy, ny = hx; // node vector = k x h, nz = 0
-  const nMag = Math.sqrt(nx * nx + ny * ny);
-
-  const rDotV = rx * vx + ry * vy + rz * vz;
-  const evx = ((vy * hz - vz * hy) / MU_EARTH) - rx / rMag;
-  const evy = ((vz * hx - vx * hz) / MU_EARTH) - ry / rMag;
-  const evz = ((vx * hy - vy * hx) / MU_EARTH) - rz / rMag;
-  const e = Math.sqrt(evx * evx + evy * evy + evz * evz);
-
-  const energy = (vMag * vMag) / 2 - MU_EARTH / rMag;
-  const aKm = -MU_EARTH / (2 * energy);
-
-  const incDeg = (Math.acos(Math.max(-1, Math.min(1, hz / hMag))) * 180) / Math.PI;
-
-  let raanDeg = 0;
-  if (nMag > 1e-8) {
-    raanDeg = (Math.acos(Math.max(-1, Math.min(1, nx / nMag))) * 180) / Math.PI;
-    if (ny < 0) raanDeg = 360 - raanDeg;
-  }
-
-  let argpDeg = 0;
-  if (nMag > 1e-8 && e > 1e-8) {
-    const cosArgp = (nx * evx + ny * evy) / (nMag * e);
-    argpDeg = (Math.acos(Math.max(-1, Math.min(1, cosArgp))) * 180) / Math.PI;
-    if (evz < 0) argpDeg = 360 - argpDeg;
-  }
-
-  let nu = 0; // true anomaly
-  if (e > 1e-8) {
-    const cosNu = (evx * rx + evy * ry + evz * rz) / (e * rMag);
-    nu = Math.acos(Math.max(-1, Math.min(1, cosNu)));
-    if (rDotV < 0) nu = 2 * Math.PI - nu;
-  }
-  const E = 2 * Math.atan2(Math.sqrt(1 - e) * Math.sin(nu / 2), Math.sqrt(1 + e) * Math.cos(nu / 2));
-  const M = E - e * Math.sin(E);
-
-  return { aKm, e, incDeg, raanDeg, argpDeg, epochM: M };
-}
-
-// If the real-world satellite position appears rotated relative to the
-// visible continents, the loaded Earth texture likely uses a different
-// longitude convention than assumed (e.g. Pacific-centered vs
-// Greenwich-centered). Adjust this in degrees to compensate — use the
-// Hawaii ground station marker as a known-truth calibration reference
-// rather than the satellite, since the marker's true position is fixed
-// and known exactly, while judging the satellite's position by eye is not.
-const EARTH_TEXTURE_LON_OFFSET_DEG = 0;
-
-function mjdToISO(mjd) {
-  const unixMs = (mjd - 40587) * 86400000;
-  return new Date(unixMs).toISOString().replace("T", " ").slice(0, 19) + "Z";
-}
-
-// Greenwich Mean Sidereal Time, in radians, for a given MJD. This is Earth's
-// true rotation angle relative to the ECI frame's X axis (vernal equinox) —
-// using this instead of an arbitrary spin rate keeps ground stations/continents
-// correctly aligned under the satellite instead of drifting independently.
-function gmstRadians(mjd) {
-  const jd = mjd + 2400000.5;
-  const T = (jd - 2451545.0) / 36525.0;
-  let gmstDeg =
-    280.46061837 +
-    360.98564736629 * (jd - 2451545.0) +
-    0.000387933 * T * T -
-    (T * T * T) / 38710000.0;
-  gmstDeg = ((gmstDeg % 360) + 360) % 360;
-  return (gmstDeg * Math.PI) / 180;
-}
-
-// Standard lat/lon (degrees) -> position on a sphere of radius `r`, matching
-// the UV convention of a typical equirectangular Earth texture on a
-// THREE.SphereGeometry (Y = polar axis, consistent with the rest of this file).
-function latLonToVector3(latDeg, lonDeg, r) {
-  const phi = ((90 - latDeg) * Math.PI) / 180;
-  const theta = ((lonDeg + 180) * Math.PI) / 180;
-  return new THREE.Vector3(
-    -r * Math.sin(phi) * Math.cos(theta),
-    r * Math.cos(phi),
-    r * Math.sin(phi) * Math.sin(theta)
-  );
-}
-
-// UH Manoa, Pacific Ocean Science & Technology (POST) building.
-const HAWAII_GROUND_STATION = { name: "UH Manoa (POST)", lat: 21.2975, lon: -157.8161 };
-
-function makeAxisLabel(text, hexColor) {
-  const size = 128;
-  const canvas = document.createElement("canvas");
-  canvas.width = size; canvas.height = size;
-  const ctx = canvas.getContext("2d");
-  ctx.font = "bold 48px monospace";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillStyle = hexColor;
-  ctx.fillText(text, size / 2, size / 2);
-  const tex = new THREE.CanvasTexture(canvas);
-  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
-  const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(0.9, 0.9, 0.9);
-  return sprite;
-}
-
-function buildEciAxes(lengthScene) {
-  const group = new THREE.Group();
-  // Scene-coordinate convention used throughout this file: sceneX = ECI_x,
-  // sceneY = ECI_z (Earth's rotation/polar axis, drawn vertical), sceneZ = -ECI_y.
-  const axes = [
-    { dir: new THREE.Vector3(1, 0, 0), color: 0xff5c5c, label: "X (ECI)" },
-    { dir: new THREE.Vector3(0, 0, -1), color: 0x5cff8a, label: "Y (ECI)" },
-    { dir: new THREE.Vector3(0, 1, 0), color: 0x5c9cff, label: "Z (ECI)" },
-  ];
-  axes.forEach(({ dir, color, label }) => {
-    const arrow = new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0), lengthScene, color, lengthScene * 0.08, lengthScene * 0.04);
-    group.add(arrow);
-    const sprite = makeAxisLabel(label, `#${color.toString(16).padStart(6, "0")}`);
-    sprite.position.copy(dir.clone().multiplyScalar(lengthScene * 1.12));
-    group.add(sprite);
-  });
-  return group;
-}
-
-const COSMOS_WEB_VERSION = "0.2.7";
-
-// Web Mercator projection, clipped at ±85° (the standard limit — Mercator
-// diverges at the poles). Returns a normalized value in roughly [-1, 1].
-// Used for BOTH the map background remap and marker plotting so they stay
-// pixel-aligned with each other.
-const MERCATOR_LAT_LIMIT = 85;
-function mercatorNormY(latDeg) {
-  const clamped = Math.max(-MERCATOR_LAT_LIMIT, Math.min(MERCATOR_LAT_LIMIT, latDeg));
-  const rad = (clamped * Math.PI) / 180;
-  const y = Math.log(Math.tan(Math.PI / 4 + rad / 2));
-  const yMax = Math.log(Math.tan(Math.PI / 4 + (MERCATOR_LAT_LIMIT * Math.PI) / 360));
-  return y / yMax;
-}
-function latLonToMercatorPx(latDeg, lonDeg, width, height) {
-  const x = ((lonDeg + 180) / 360) * width;
-  const yNorm = mercatorNormY(latDeg);
-  const y = height / 2 - (yNorm * height) / 2;
-  return { x, y };
-}
-// Inverse: given a normalized Mercator y in [-1,1], return latitude in degrees.
-function mercatorNormYToLat(yNorm) {
-  const yMax = Math.log(Math.tan(Math.PI / 4 + (MERCATOR_LAT_LIMIT * Math.PI) / 360));
-  const rad = 2 * (Math.atan(Math.exp(yNorm * yMax)) - Math.PI / 4);
-  return (rad * 180) / Math.PI;
-}
-
-// Approximate subsolar point (the point on Earth directly under the sun) for
-// a given MJD, using the standard low-precision solar position formulas from
-// the Astronomical Almanac. Accurate to a fraction of a degree — plenty for
-// a day/night terminator overlay.
-function getSubsolarPoint(mjd) {
-  const jd = mjd + 2400000.5;
-  const n = jd - 2451545.0;
-  const Ldeg = (280.46 + 0.9856474 * n) % 360;
-  const gDeg = ((357.528 + 0.9856003 * n) % 360 + 360) % 360;
-  const g = (gDeg * Math.PI) / 180;
-  const lambdaDeg = Ldeg + 1.915 * Math.sin(g) + 0.02 * Math.sin(2 * g);
-  const lambda = (lambdaDeg * Math.PI) / 180;
-  const eps = ((23.439 - 0.0000004 * n) * Math.PI) / 180;
-
-  const decl = Math.asin(Math.sin(eps) * Math.sin(lambda));
-  const alpha = Math.atan2(Math.cos(eps) * Math.sin(lambda), Math.cos(lambda));
-
-  const gmstDeg = (gmstRadians(mjd) * 180) / Math.PI;
-  let lon = (alpha * 180) / Math.PI - gmstDeg;
-  lon = ((lon + 180) % 360 + 360) % 360 - 180;
-
-  return { lat: (decl * 180) / Math.PI, lon };
-}
-
-// Latitude of the day/night terminator at a given longitude, for a sun at
-// (subLat, subLon). The terminator is a great circle, so this traces a
-// smooth wave across longitude — cheap to sample per-column rather than
-// per-pixel.
-function terminatorLatAtLon(lonDeg, subLat, subLon) {
-  const deltaLon = (((lonDeg - subLon + 540) % 360) - 180) * (Math.PI / 180);
-  const subLatRad = (subLat * Math.PI) / 180;
-  if (Math.abs(subLatRad) < 1e-6) return -Math.sign(Math.cos(deltaLon) || 1) * 89.9;
-  const lat = Math.atan(-Math.cos(deltaLon) / Math.tan(subLatRad));
-  return (lat * 180) / Math.PI;
-}
-
-// Points around the satellite's ground-coverage circle (horizon visibility
-// footprint) at a given sub-satellite point and altitude.
-function groundCoveragePoints(centerLat, centerLon, altKm, steps = 72) {
-  const angularRadius = Math.acos(EARTH_RADIUS_KM / (EARTH_RADIUS_KM + Math.max(altKm, 1)));
-  const lat1 = (centerLat * Math.PI) / 180, lon1 = (centerLon * Math.PI) / 180;
-  const pts = [];
-  for (let i = 0; i <= steps; i++) {
-    const bearing = (2 * Math.PI * i) / steps;
-    const lat2 = Math.asin(
-      Math.sin(lat1) * Math.cos(angularRadius) + Math.cos(lat1) * Math.sin(angularRadius) * Math.cos(bearing)
-    );
-    const lon2 = lon1 + Math.atan2(
-      Math.sin(bearing) * Math.sin(angularRadius) * Math.cos(lat1),
-      Math.cos(angularRadius) - Math.sin(lat1) * Math.sin(lat2)
-    );
-    pts.push({ lat: (lat2 * 180) / Math.PI, lon: (((lon2 * 180) / Math.PI + 540) % 360) - 180 });
-  }
-  return pts;
-}
-
 export default function OrbitViewer() {
   const mountRef = useRef(null);
   const sceneRef = useRef({});
+  const isMobile = useIsMobile();
+  const [panelOpen, setPanelOpen] = useState(false); // mobile controls bottom-sheet
   const [activeView, setActiveView] = useState("3d");
   // Ground-track history and future ground-track, in lat/lon — populated by
   // the 3D scene's animation loop but read by the 2D map view, so both views
@@ -440,16 +71,114 @@ export default function OrbitViewer() {
   const [speed, setSpeed] = useState(60);
   const [running, setRunning] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
+  const [showEcef, setShowEcef] = useState(false);
   const [showSun, setShowSun] = useState(true);
+  const [showBodies, setShowBodies] = useState(true); // visible Sun + Moon spheres
+  const [showSunVector, setShowSunVector] = useState(false);
+  const [showProjection, setShowProjection] = useState(false); // sub-satellite point on the surface
   const [showFuture, setShowFuture] = useState(false);
+  const [showCountries, setShowCountries] = useState(false);
+  const [showLabels, setShowLabels] = useState(true); // ground-station + reference-frame text labels (markers/vectors stay regardless)
+  const [followSat, setFollowSat] = useState(false);
+  const [missionResetKey, setMissionResetKey] = useState(0);
   const [nodeName, setNodeName] = useState("propagator-sim");
   const [satName, setSatName] = useState("ISS (ZARYA)");
   const [wsUrl, setWsUrl] = useState("");
   const [linkState, setLinkState] = useState("SIMULATED"); // SIMULATED | CONNECTING | LIVE | ERROR
-  const [telem, setTelem] = useState({ x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, alt: 0, mjd: 60107.0 });
+  const [telem, setTelem] = useState({ x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, alt: 0, mjd: 60107.0, simSec: 0 });
   useEffect(() => { telemRef.current = telem; }, [telem]);
+
+  // Realm / node registry. A realm is a named grouping of nodes (spacecraft
+  // agents); in a full deployment the node list for a realm comes from that
+  // realm's agent registry — here it's seeded locally and grows as live
+  // telemetry reports node names. The selected node is what the header shows
+  // and what the visualization is treated as representing.
+  const [realm, setRealm] = useState("cosmos");
+  const [realms, setRealms] = useState(["cosmos"]);
+  const [nodesByRealm, setNodesByRealm] = useState({ cosmos: ["propagator-sim"] });
+  const realmRef = useRef(realm);
+  useEffect(() => { realmRef.current = realm; }, [realm]);
+
+  // Editable ground stations (see the Ground Stations tab). Rendered as markers
+  // in the 3D and 2D views; a line is drawn to the satellite during a pass.
+  // `enabled` gates whether the station is drawn / considered for passes.
+  const [groundStations, setGroundStations] = useState([
+    { id: "hsfl-hig", name: "HSFL-HIG", lat: 21.2975, lon: -157.8161, alt: 0.1, enabled: true },
+    { id: "hsfl-nwic", name: "HSFL-NWIC", lat: 22.2975, lon: -157.8161, alt: 0.1, enabled: true },
+    { id: "uvic", name: "UVIC", lat: 48.4634, lon: -123.3117, alt: 0.06, enabled: true },
+    { id: "nps", name: "NPS", lat: 36.598056, lon: -121.875, alt: 0.01, enabled: true },
+    { id: "tagus", name: "Tagus Park", lat: 38.740561, lon: -9.304168, alt: 0.1, enabled: true },
+  ]);
+  const groundStationsRef = useRef(groundStations);
+  useEffect(() => { groundStationsRef.current = groundStations; }, [groundStations]);
+  const [selectedGSId, setSelectedGSId] = useState("hsfl-hig"); // the focused ground station
+
+  // Collapsible HUDs / mission-timeline scrub / playback direction.
+  const [telemCollapsed, setTelemCollapsed] = useState(false);
+  const [controlsCollapsed, setControlsCollapsed] = useState(false);
+  const [scrubTime, setScrubTime] = useState(null); // null = follow playback; number = frozen at this sim-second
+  const [reverse, setReverse] = useState(false); // play the mission timeline backwards
+  const prevOrbitElRef = useRef(null); // detect orbit-element edits to reset the messy trails
+
+  // Reflect the active view in the browser tab title.
+  useEffect(() => {
+    const label = VIEW_TABS.find((t) => t.id === activeView)?.label;
+    document.title = label ? `COSMOS Web - ${label}` : "COSMOS Web";
+  }, [activeView]);
+
   const wsRef = useRef(null);
   const liveTargetRef = useRef(null);
+  const attitudeRef = useRef(null); // latest {w,x,y,z} attitude quaternion from telemetry (alphaatt)
+
+  // Live-read snapshot for the Satellite view's render loop, so toggling
+  // pause / link state doesn't tear down and rebuild that Three.js scene.
+  const satMountRef = useRef(null);
+  // Satellite 3D view modes:
+  //  "turntable" — model rotating at the origin for design inspection (not tied
+  //                to flight dynamics)
+  //  "orbital"   — model at its real orbital position, Z→nadir / X→velocity,
+  //                flying around the Earth (chase camera)
+  //  "attitude"  — same real position/attitude, with the attitude sphere drawn
+  //                around the spacecraft, above the correct Earth site
+  const [satViewMode, setSatViewMode] = useState("turntable");
+  const [showBodyAxes, setShowBodyAxes] = useState(true);
+  const [showInertialAxes, setShowInertialAxes] = useState(false);
+  const [showMagVector, setShowMagVector] = useState(false);
+  const [satModelScale, setSatModelScale] = useState(0.22); // model size in the flight views
+  const [attSphereScale, setAttSphereScale] = useState(1); // attitude-sphere size multiplier
+  const satCtlRef = useRef({ running: true, linkState: "SIMULATED", mode: "turntable", bodyAxes: true, inertialAxes: false, sunVec: false, magVec: false, modelScale: 0.22, attScale: 1 });
+  useEffect(() => {
+    satCtlRef.current = {
+      running, linkState, mode: satViewMode,
+      bodyAxes: showBodyAxes, inertialAxes: showInertialAxes,
+      sunVec: showSunVector, magVec: showMagVector, modelScale: satModelScale, attScale: attSphereScale,
+    };
+  }, [running, linkState, satViewMode, showBodyAxes, showInertialAxes, showSunVector, showMagVector, satModelScale, attSphereScale]);
+  // Which spacecraft model the Satellite 3D view renders.
+  const [satModel, setSatModel] = useState("default"); // default | cubesat3u | cubesat6u
+  const SAT_MODELS = [
+    { id: "default", label: "Default" },
+    { id: "cubesat3u", label: "3U CubeSat" },
+    { id: "cubesat6u", label: "6U CubeSat" },
+  ];
+  // Current spacecraft attitude (quaternion + derived Euler), pushed from the
+  // Satellite view's render loop for the telemetry readout.
+  const [satAtt, setSatAtt] = useState({ w: 1, x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0, src: "presentation" });
+  // Mission-elapsed-time origin (MJD). Sim starts at the fixed epoch below;
+  // a live link re-anchors it to the first telemetry timestamp received.
+  const MISSION_EPOCH_MJD = 60107;
+  const metStartRef = useRef(MISSION_EPOCH_MJD);
+  useEffect(() => {
+    if (linkState === "LIVE") metStartRef.current = null;               // re-anchor on next telemetry
+    else if (linkState === "SIMULATED") metStartRef.current = MISSION_EPOCH_MJD;
+  }, [linkState]);
+  useEffect(() => {
+    if (linkState === "LIVE" && metStartRef.current == null && telem.mjd) metStartRef.current = telem.mjd;
+  }, [linkState, telem.mjd]);
+
+  // Keep the mobile bottom-sheet from lingering after a layout/tab change.
+  useEffect(() => { if (!isMobile) setPanelOpen(false); }, [isMobile]);
+  useEffect(() => { setPanelOpen(false); }, [activeView]);
 
   const elementsRef = useRef(null);
 
@@ -510,11 +239,56 @@ export default function OrbitViewer() {
     const rimMat = new THREE.MeshBasicMaterial({ color: 0x3fa9ff, transparent: true, opacity: 0.06, side: THREE.BackSide });
     scene.add(new THREE.Mesh(rimGeo, rimMat));
 
+    // Equator ring — parented to `earth` so it stays over 0° latitude as the
+    // planet rotates.
+    {
+      const er = kmToScene(EARTH_RADIUS_KM) * 1.001, pts = [];
+      for (let i = 0; i <= 128; i++) {
+        const a = (i / 128) * Math.PI * 2;
+        pts.push(new THREE.Vector3(er * Math.cos(a), 0, er * Math.sin(a)));
+      }
+      const equator = new THREE.LineLoop(
+        new THREE.BufferGeometry().setFromPoints(pts),
+        new THREE.LineBasicMaterial({ color: 0xffd24a, transparent: true, opacity: 0.45 })
+      );
+      earth.add(equator);
+    }
+
     const ambient = new THREE.AmbientLight(0x223344, 1.1);
     scene.add(ambient);
     const sun = new THREE.DirectionalLight(0xffffff, 1.4);
     sun.position.set(30, 10, 20);
     scene.add(sun);
+
+    // Visible Sun + Moon bodies. The Sun sphere is parked far along the true
+    // Sun direction (well inside the camera far plane — real 1 AU would be way
+    // beyond it); the Moon sits at its real geocentric distance in scene units.
+    // Positions are refreshed every frame from the ephemeris helpers.
+    const SUN_DIST = 1400;
+    const SUN_R = kmToScene(EARTH_RADIUS_KM) * 6;
+    const sunBody = new THREE.Group();
+    sunBody.add(new THREE.Mesh(
+      new THREE.SphereGeometry(SUN_R, 32, 32),
+      new THREE.MeshBasicMaterial({ color: 0xffe066 })
+    ));
+    sunBody.add(new THREE.Mesh(
+      new THREE.SphereGeometry(SUN_R * 1.7, 32, 32),
+      new THREE.MeshBasicMaterial({ color: 0xffd24a, transparent: true, opacity: 0.18, depthWrite: false })
+    ));
+    const sunBodyLabel = makeAxisLabel("☀ Sun", "#ffe066", false, SUN_R * 2.2);
+    sunBodyLabel.position.set(0, SUN_R * 3, 0);
+    sunBody.add(sunBodyLabel);
+    scene.add(sunBody);
+
+    const moonBody = new THREE.Group();
+    moonBody.add(new THREE.Mesh(
+      new THREE.SphereGeometry(kmToScene(EARTH_RADIUS_KM) * 0.9, 32, 32),
+      new THREE.MeshPhongMaterial({ color: 0xcfd2d6, shininess: 2 })
+    ));
+    const moonBodyLabel = makeAxisLabel("☾ Moon", "#cfd2d6", false, kmToScene(EARTH_RADIUS_KM) * 2);
+    moonBodyLabel.position.set(0, kmToScene(EARTH_RADIUS_KM) * 2.4, 0);
+    moonBody.add(moonBodyLabel);
+    scene.add(moonBody);
 
     const orbitLineGeo = new THREE.BufferGeometry();
     const orbitLineMat = new THREE.LineBasicMaterial({ color: 0x8fd7ff, transparent: true, opacity: 0.35 });
@@ -543,26 +317,76 @@ export default function OrbitViewer() {
     futureLine.visible = false;
     scene.add(futureLine);
 
-    const eciAxes = buildEciAxes(kmToScene(EARTH_RADIUS_KM) * 2.2);
+    const eciAxes = buildAxesTriad(kmToScene(EARTH_RADIUS_KM) * 2.2, "ECI");
     scene.add(eciAxes);
 
-    // Ground station marker — parented to `earth`, not `scene`, since a
-    // ground station is fixed to Earth's surface and must rotate with it
-    // (unlike the satellite, which lives in the inertial ECI frame).
-    const gsGroup = new THREE.Group();
-    const gsPos = latLonToVector3(HAWAII_GROUND_STATION.lat, HAWAII_GROUND_STATION.lon, kmToScene(EARTH_RADIUS_KM));
-    const gsMarkerGeo = new THREE.ConeGeometry(0.06, 0.16, 8);
-    const gsMarkerMat = new THREE.MeshBasicMaterial({ color: 0x5eff9c });
-    const gsMarker = new THREE.Mesh(gsMarkerGeo, gsMarkerMat);
-    gsMarker.position.copy(gsPos);
-    gsMarker.lookAt(gsPos.clone().multiplyScalar(2)); // point outward, away from center
-    gsMarker.rotateX(Math.PI / 2);
-    gsGroup.add(gsMarker);
-    const gsLabel = makeAxisLabel(HAWAII_GROUND_STATION.name, "#5eff9c");
-    gsLabel.position.copy(gsPos.clone().multiplyScalar(1.12));
-    gsLabel.scale.set(1.4, 0.7, 1);
-    gsGroup.add(gsLabel);
-    earth.add(gsGroup);
+    // ECEF triad — parented to `earth`, so it rotates with the planet. Shorter
+    // than the ECI triad so the shared polar (Z) axis stays readable.
+    const ecefAxes = buildAxesTriad(kmToScene(EARTH_RADIUS_KM) * 1.85, "ECEF");
+    ecefAxes.visible = false;
+    earth.add(ecefAxes);
+
+    // Sun vector — an arrow from Earth centre toward the Sun, updated each
+    // frame from the subsolar point. Parented to `earth` so the earth-fixed
+    // subsolar direction maps to the right world direction as the planet spins.
+    const sunArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 0),
+      kmToScene(EARTH_RADIUS_KM) * 2.6, 0xffe066,
+      kmToScene(EARTH_RADIUS_KM) * 0.18, kmToScene(EARTH_RADIUS_KM) * 0.09
+    );
+    const sunLabel = makeAxisLabel("☀ Sun", "#ffe066", false, kmToScene(EARTH_RADIUS_KM) * 0.22);
+    sunArrow.add(sunLabel);
+    sunLabel.position.set(0, kmToScene(EARTH_RADIUS_KM) * 2.7, 0); // tip is along the arrow's local +Y
+    sunArrow.visible = false;
+    earth.add(sunArrow);
+
+    // Magnetic-field vector at the satellite — a spin-aligned centred dipole
+    // (moment toward geographic south). Updated per-frame from the sat position.
+    const magArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 0),
+      kmToScene(EARTH_RADIUS_KM) * 0.9, 0xff6ec7,
+      kmToScene(EARTH_RADIUS_KM) * 0.14, kmToScene(EARTH_RADIUS_KM) * 0.07
+    );
+    magArrow.add(makeAxisLabel("B", "#ff6ec7", false, kmToScene(EARTH_RADIUS_KM) * 0.22));
+    magArrow.children[0].position.set(0, kmToScene(EARTH_RADIUS_KM) * 1.0, 0);
+    magArrow.visible = false;
+    scene.add(magArrow);
+
+    // Sub-satellite point: a marker on the surface directly below the
+    // satellite, plus a drop line down to it (both in the inertial scene
+    // frame — "directly below" is just along the position vector).
+    const subSatDot = new THREE.Mesh(
+      new THREE.SphereGeometry(0.06, 12, 12),
+      new THREE.MeshBasicMaterial({ color: 0xffb454 })
+    );
+    const subSatRingGeo = new THREE.RingGeometry(0.12, 0.16, 32);
+    const subSatRing = new THREE.Mesh(subSatRingGeo, new THREE.MeshBasicMaterial({ color: 0xffb454, transparent: true, opacity: 0.5, side: THREE.DoubleSide }));
+    const subSatDropGeo = new THREE.BufferGeometry();
+    subSatDropGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+    const subSatDrop = new THREE.Line(subSatDropGeo, new THREE.LineDashedMaterial({ color: 0xffb454, dashSize: 0.12, gapSize: 0.08, transparent: true, opacity: 0.6 }));
+    const subSatGroup = new THREE.Group();
+    subSatGroup.add(subSatDot, subSatRing, subSatDrop);
+    subSatGroup.visible = false;
+    scene.add(subSatGroup);
+
+    // Country-boundary overlay — fetched on demand, parented to `earth` so it
+    // rotates with the surface. Stays hidden until the "Show country
+    // boundaries" toggle is on (synced via sceneRef.current.control).
+    fetch(COUNTRIES_GEOJSON_URL)
+      .then((r) => r.json())
+      .then((gj) => {
+        const cg = buildCountryBoundaries(gj, kmToScene(EARTH_RADIUS_KM) * 1.01);
+        cg.visible = !!(sceneRef.current.control && sceneRef.current.control.showCountries);
+        const labels = cg.getObjectByName("countryLabels");
+        if (labels) labels.visible = cg.visible;
+        earth.add(cg);
+        sceneRef.current.countryGroup = cg;
+      })
+      .catch(() => { /* offline / blocked — overlay just stays unavailable */ });
+
+    // Ground-station markers, LOS lines and the pass line are built by a
+    // separate effect (they depend on the editable `groundStations` list) and
+    // updated per-frame in the animate loop below via sceneRef.current.gsEntries.
 
     const satGeo = new THREE.SphereGeometry(0.09, 16, 16);
     const satMat = new THREE.MeshBasicMaterial({ color: 0xffb454 });
@@ -575,11 +399,11 @@ export default function OrbitViewer() {
     satellite.add(glow);
 
     // manual orbit-camera controls (r128 has no OrbitControls import)
-    let dragging = false, lastX = 0, lastY = 0;
+    let dragging = false, lastX = 0, lastY = 0, touchCount = 0, pinchPrev = 0;
     const onDown = (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; };
     const onUp = () => { dragging = false; };
     const onMove = (e) => {
-      if (!dragging) return;
+      if (!dragging || touchCount >= 2) return; // let pinch-zoom own multi-touch
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
       camTheta += dx * 0.005;
@@ -587,29 +411,67 @@ export default function OrbitViewer() {
     };
     const onWheel = (e) => {
       e.preventDefault();
-      camDist = Math.min(Math.max(camDist + e.deltaY * 0.01, 8), 90);
+      camDist = Math.min(Math.max(camDist + e.deltaY * 0.01, 4), 90);
     };
+    // Touch: one finger drags (via pointer events above), two fingers pinch-zoom.
+    const pinchGap = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const onTouchStart = (e) => {
+      touchCount = e.touches.length;
+      if (touchCount >= 2) { dragging = false; pinchPrev = pinchGap(e.touches); }
+    };
+    const onTouchMove = (e) => {
+      if (e.touches.length < 2) return;
+      e.preventDefault();
+      const gap = pinchGap(e.touches);
+      if (pinchPrev) camDist = Math.min(Math.max(camDist + (pinchPrev - gap) * 0.04, 4), 90);
+      pinchPrev = gap;
+    };
+    const onTouchEnd = (e) => {
+      touchCount = e.touches.length;
+      if (touchCount < 2) pinchPrev = 0;
+    };
+    renderer.domElement.style.touchAction = "none"; // stop the browser from scrolling/zooming the page on drag
     renderer.domElement.addEventListener("pointerdown", onDown);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointermove", onMove);
     renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+    renderer.domElement.addEventListener("touchstart", onTouchStart, { passive: false });
+    renderer.domElement.addEventListener("touchmove", onTouchMove, { passive: false });
+    renderer.domElement.addEventListener("touchend", onTouchEnd);
+    renderer.domElement.addEventListener("touchcancel", onTouchEnd);
 
+    // Camera orbits the origin normally, or the satellite when "Follow
+    // satellite" is on — same drag/zoom offset, re-centered on the target.
+    const DEFAULT_CAM = { camDist: 26, camTheta: 0.9, camPhi: 1.15 };
+    const camTarget = new THREE.Vector3();
     function updateCamera() {
+      const ctrl = sceneRef.current.control;
+      if (ctrl && ctrl.followSat) camTarget.copy(satellite.position);
+      else camTarget.set(0, 0, 0);
       camera.position.set(
-        camDist * Math.sin(camPhi) * Math.cos(camTheta),
-        camDist * Math.cos(camPhi),
-        camDist * Math.sin(camPhi) * Math.sin(camTheta)
+        camTarget.x + camDist * Math.sin(camPhi) * Math.cos(camTheta),
+        camTarget.y + camDist * Math.cos(camPhi),
+        camTarget.z + camDist * Math.sin(camPhi) * Math.sin(camTheta)
       );
-      camera.lookAt(0, 0, 0);
+      camera.lookAt(camTarget);
     }
     updateCamera();
 
     sceneRef.current = {
-      scene, camera, renderer, earth, orbitLine, orbitLineGeo, satellite, eciAxes,
+      ...sceneRef.current,
+      scene, camera, renderer, earth, orbitLine, orbitLineGeo, satellite, eciAxes, ecefAxes,
+      sunArrow, magArrow, sunBody, moonBody, subSatGroup, subSatDot, subSatRing, subSatDrop,
       trailLine, trailPoints, sun, ambient, earthMat, orbitLineMat, trailMat, futureLine, futureGeo,
       updateCamera, getCamState: () => ({ camDist, camTheta, camPhi }),
       setCamState: (s) => { camDist = s.camDist; camTheta = s.camTheta; camPhi = s.camPhi; },
+      resetView: () => { camDist = DEFAULT_CAM.camDist; camTheta = DEFAULT_CAM.camTheta; camPhi = DEFAULT_CAM.camPhi; },
     };
+
+    // Reusable temporaries for the per-frame ground-station LOS update.
+    const _gsWorld = new THREE.Vector3();
+    const _gsUp = new THREE.Vector3();
+    const _toSat = new THREE.Vector3();
+    const GS_ELEV_SIN = Math.sin((GS_ELEVATION_MASK_DEG * Math.PI) / 180);
 
     let raf;
     let simTime = 0;
@@ -621,6 +483,13 @@ export default function OrbitViewer() {
     let cloudDrift = 0;
     let lastTrailPush = 0;
     let lastFutureUpdate = 0;
+    let lastFutureNonce = -1;
+    let lastResetNonce = 0;
+    const _subSol = new THREE.Vector3();
+    const _sunWorld = new THREE.Vector3();
+    const _subPt = new THREE.Vector3();
+    const _magR = new THREE.Vector3();
+    const _magB = new THREE.Vector3();
 
     const FUTURE_GROUND_TRACK_SECONDS = 1.5 * 3600;
 
@@ -674,13 +543,39 @@ export default function OrbitViewer() {
       earth.rotation.y = gmstRadians(currentMjd) + (EARTH_TEXTURE_LON_OFFSET_DEG * Math.PI) / 180;
       cloudDrift += dt * 0.006;
       if (clouds) clouds.rotation.y = gmstRadians(currentMjd) + cloudDrift;
-      updateCamera();
 
       const ctrl = sceneRef.current.control;
       let curXKm = null, curYKm = null, curZKm = null;
-      if (ctrl && ctrl.running) {
-        if (ctrl.mode === "sim") {
-          simTime += dt * ctrl.speed;
+      if (ctrl) {
+        // Mission-timeline scrub: when scrubTime is set, freeze sim time there
+        // (works whether or not playback is "running"); otherwise advance.
+        const scrubbing = ctrl.mode === "sim" && ctrl.scrubTime != null;
+        const advancing = ctrl.running && !scrubbing;
+
+        // On an orbit-element edit, recompute the forward path this frame.
+        if (ctrl.futureNonce !== lastFutureNonce) {
+          lastFutureNonce = ctrl.futureNonce;
+          lastFutureUpdate = 0;
+        }
+
+        // Mission reset: snap sim time back to the epoch and wipe the trail.
+        let didReset = false;
+        if (ctrl.resetNonce !== lastResetNonce) {
+          lastResetNonce = ctrl.resetNonce;
+          didReset = true;
+          simTime = 0;
+          currentMjd = 60107;
+          lastGroundTrackMjd = -Infinity;
+          trailPoints.length = 0;
+          trailGeo.setDrawRange(0, 0);
+        }
+
+        if (ctrl.mode === "sim" && (advancing || scrubbing || didReset)) {
+          simTime = scrubbing
+            ? ctrl.scrubTime
+            : didReset
+              ? 0
+              : Math.max(0, simTime + (ctrl.reverse ? -1 : 1) * dt * ctrl.speed);
           const els = ctrl.elements;
           const { x, y, z, vx, vy, vz, rMag } = keplerToECI(els, simTime);
           satellite.position.set(kmToScene(x), kmToScene(z), -kmToScene(y));
@@ -690,12 +585,13 @@ export default function OrbitViewer() {
             x, y, z, vx, vy, vz,
             alt: rMag - EARTH_RADIUS_KM,
             mjd: currentMjd,
+            simSec: simTime,
           });
           if (now - lastFutureUpdate > 3000) {
             lastFutureUpdate = now;
             updateFutureTrajectory(x, y, z, vx, vy, vz);
           }
-        } else if (ctrl.mode === "live" && liveTargetRef.current) {
+        } else if (ctrl.mode === "live" && ctrl.running && liveTargetRef.current) {
           const t = liveTargetRef.current;
           satellite.position.lerp(
             new THREE.Vector3(kmToScene(t.x), kmToScene(t.z), -kmToScene(t.y)),
@@ -709,7 +605,7 @@ export default function OrbitViewer() {
           }
         }
 
-        if (now - lastTrailPush > 150) {
+        if (advancing && now - lastTrailPush > 150) {
           lastTrailPush = now;
           pushTrailPoint(satellite.position);
         }
@@ -719,7 +615,7 @@ export default function OrbitViewer() {
         // (one per 150ms of real time), while at 600x speed it would barely
         // sample at all. Fixed mission-time spacing keeps a consistent,
         // reasonably-sized trail regardless of playback speed.
-        if (curXKm != null && currentMjd - lastGroundTrackMjd >= GROUND_TRACK_SAMPLE_INTERVAL_DAYS) {
+        if (advancing && !ctrl.reverse && curXKm != null && currentMjd - lastGroundTrackMjd >= GROUND_TRACK_SAMPLE_INTERVAL_DAYS) {
           lastGroundTrackMjd = currentMjd;
           const { lat, lon } = eciToLatLon(curXKm, curYKm, curZKm, currentMjd);
           groundTrackRef.current.push({ lat, lon, mjd: currentMjd });
@@ -731,6 +627,74 @@ export default function OrbitViewer() {
           }
         }
       }
+
+      // Sun direction from the subsolar point (earth-local). It drives both the
+      // Sun-vector arrow AND the directional light, so the lit hemisphere and
+      // the arrow always agree.
+      {
+        const sub = getSubsolarPoint(currentMjd);
+        _subSol.copy(latLonToVector3(sub.lat, sub.lon, 1)).normalize();
+        if (sunArrow.visible) sunArrow.setDirection(_subSol);
+        _sunWorld.copy(_subSol).applyQuaternion(earth.quaternion).normalize();
+        if (sun.intensity > 0) sun.position.copy(_sunWorld).multiplyScalar(60);
+        if (sunBody.visible) sunBody.position.copy(_sunWorld).multiplyScalar(SUN_DIST);
+        if (moonBody.visible) {
+          const m = getMoonEci(currentMjd);
+          moonBody.position.set(kmToScene(m.x), kmToScene(m.z), -kmToScene(m.y));
+        }
+      }
+
+      // Magnetic-field vector at the satellite (spin-aligned centred dipole,
+      // moment toward geographic south = scene -Y): B ∝ 3(m̂·r̂)r̂ − m̂.
+      if (magArrow.visible) {
+        _magR.copy(satellite.position).normalize();
+        const mDotR = -_magR.y;
+        _magB.set(3 * mDotR * _magR.x, 3 * mDotR * _magR.y + 1, 3 * mDotR * _magR.z).normalize();
+        magArrow.position.copy(satellite.position);
+        magArrow.setDirection(_magB);
+      }
+
+      // Sub-satellite point: surface marker directly beneath the satellite,
+      // plus a dashed drop line. "Directly beneath" == along the radius.
+      if (subSatGroup.visible) {
+        const sp = satellite.position;
+        _subPt.copy(sp).setLength(kmToScene(EARTH_RADIUS_KM) * 1.002);
+        subSatGroup.children[0].position.copy(_subPt);          // dot
+        const ring = subSatGroup.children[1];
+        ring.position.copy(_subPt);
+        ring.lookAt(0, 0, 0);                                   // lie flat on the surface
+        const dpos = subSatGroup.children[2].geometry.attributes.position;
+        dpos.setXYZ(0, _subPt.x, _subPt.y, _subPt.z);
+        dpos.setXYZ(1, sp.x, sp.y, sp.z);
+        dpos.needsUpdate = true;
+        subSatGroup.children[2].computeLineDistances();
+      }
+
+      // Ground-station line-of-sight: draw a line to the satellite whenever it
+      // is above that station's elevation mask (a pass). Endpoints are read
+      // straight off the marker's world transform so the line always touches it.
+      const gsEntries = sceneRef.current.gsEntries;
+      if (gsEntries && gsEntries.length) {
+        earth.updateMatrixWorld();
+        const sp = satellite.position;
+        for (const e of gsEntries) {
+          e.marker.getWorldPosition(_gsWorld);
+          _toSat.copy(sp).sub(_gsWorld).normalize();
+          _gsUp.copy(_gsWorld).normalize();
+          const vis = _toSat.dot(_gsUp) > GS_ELEV_SIN;
+          e.line.visible = vis;
+          if (vis) {
+            const pos = e.line.geometry.attributes.position;
+            pos.setXYZ(0, _gsWorld.x, _gsWorld.y, _gsWorld.z);
+            pos.setXYZ(1, sp.x, sp.y, sp.z);
+            pos.needsUpdate = true;
+          }
+        }
+      }
+
+      // After the satellite's position is updated this frame, so "Follow
+      // satellite" tracks without a frame of lag.
+      updateCamera();
       renderer.render(scene, camera);
     };
     animate();
@@ -749,11 +713,95 @@ export default function OrbitViewer() {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointermove", onMove);
       renderer.domElement.removeEventListener("wheel", onWheel);
+      renderer.domElement.removeEventListener("touchstart", onTouchStart);
+      renderer.domElement.removeEventListener("touchmove", onTouchMove);
+      renderer.domElement.removeEventListener("touchend", onTouchEnd);
+      renderer.domElement.removeEventListener("touchcancel", onTouchEnd);
       renderer.dispose();
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Ground-station markers, labels and LOS lines — rebuilt when the editable
+  // list changes. Per-frame LOS updates happen in the animate loop above.
+  useEffect(() => {
+    const s = sceneRef.current;
+    if (!s.earth || !s.scene) return;
+
+    const root = new THREE.Group();
+    const entries = [];
+    const surfR = kmToScene(EARTH_RADIUS_KM);
+    const gsLabelHeight = surfR * 0.03;
+    for (const gs of groundStations) {
+      if (gs.enabled === false) continue;
+      const lat = numOr(gs.lat), lon = numOr(gs.lon), alt = Math.max(0, numOr(gs.alt));
+      const p = latLonToVector3(lat, lon, kmToScene(EARTH_RADIUS_KM + alt));
+      const isSelected = gs.id === selectedGSId;
+
+      const marker = new THREE.Mesh(
+        new THREE.ConeGeometry(isSelected ? 0.1 : 0.06, isSelected ? 0.26 : 0.16, 8),
+        new THREE.MeshBasicMaterial({ color: isSelected ? 0xaaffcc : 0x5eff9c })
+      );
+      marker.position.copy(p);
+      marker.lookAt(p.clone().multiplyScalar(2));
+      marker.rotateX(Math.PI / 2);
+      root.add(marker);
+
+      if (isSelected) {
+        const halo = new THREE.Mesh(
+          new THREE.RingGeometry(0.14, 0.2, 24),
+          new THREE.MeshBasicMaterial({ color: 0x5eff9c, transparent: true, opacity: 0.5, side: THREE.DoubleSide })
+        );
+        halo.position.copy(p.clone().normalize().multiplyScalar(surfR * 1.001));
+        halo.lookAt(0, 0, 0);
+        root.add(halo);
+      }
+
+      // Label lies flat on the Earth (tangent plane), like the country labels,
+      // rather than a camera-facing billboard.
+      const { tex, aspect } = makeLabelTexture(gs.name || "station", "#7dffbf");
+      const label = new THREE.Mesh(
+        new THREE.PlaneGeometry(gsLabelHeight * aspect, gsLabelHeight),
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide })
+      );
+      const lp = p.clone().normalize().multiplyScalar(surfR * 1.004);
+      label.position.copy(lp);
+      orientFlatOnSphere(label, lp);
+      label.translateY(gsLabelHeight * 1.1); // sit just "north" of the marker cone
+      label.visible = showLabels;
+      root.add(label);
+
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+      const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0x5eff9c, transparent: true, opacity: 0.9 }));
+      line.frustumCulled = false;
+      line.visible = false;
+      s.scene.add(line);
+
+      entries.push({ marker, label, line });
+    }
+    s.earth.add(root);
+    s.gsRoot = root;
+    s.gsLabels = entries.map((e) => e.label);
+    s.gsEntries = entries;
+
+    return () => {
+      s.earth.remove(root);
+      root.traverse((o) => {
+        o.geometry?.dispose?.();
+        const m = o.material;
+        (Array.isArray(m) ? m : m ? [m] : []).forEach((mm) => { mm.map?.dispose?.(); mm.dispose(); });
+      });
+      entries.forEach((e) => {
+        s.scene.remove(e.line);
+        e.line.geometry.dispose();
+        e.line.material.dispose();
+      });
+      if (s.gsRoot === root) { s.gsRoot = null; s.gsEntries = []; s.gsLabels = []; }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groundStations, selectedGSId]);
 
   // Push current control state into the render loop each render
   useEffect(() => {
@@ -764,7 +812,27 @@ export default function OrbitViewer() {
       s.orbitLineGeo.setFromPoints(pts);
     }
     if (s.eciAxes) {
+      // "Show ECI reference frame" hides the whole thing; "labels" hides only
+      // the axis text sprites, leaving the arrow vectors visible.
       s.eciAxes.visible = showAxes;
+      s.eciAxes.traverse((o) => { if (o.isSprite) o.visible = showLabels; });
+    }
+    if (s.ecefAxes) {
+      s.ecefAxes.visible = showEcef;
+      s.ecefAxes.traverse((o) => { if (o.isSprite) o.visible = showLabels; });
+    }
+    if (s.sunArrow) s.sunArrow.visible = showSunVector;
+    if (s.magArrow) s.magArrow.visible = showMagVector;
+    if (s.sunBody) s.sunBody.visible = showBodies;
+    if (s.moonBody) s.moonBody.visible = showBodies;
+    if (s.subSatGroup) s.subSatGroup.visible = showProjection;
+    // Ground-station text labels follow the same "labels" toggle; the marker
+    // cones stay visible regardless.
+    if (s.gsLabels) s.gsLabels.forEach((l) => { l.visible = showLabels; });
+    if (s.countryGroup) {
+      s.countryGroup.visible = showCountries;
+      const cl = s.countryGroup.getObjectByName("countryLabels");
+      if (cl) cl.visible = showCountries;
     }
     if (s.sun && s.ambient) {
       // "Sun off" swaps directional lighting for flat, uniform brightness so
@@ -794,12 +862,22 @@ export default function OrbitViewer() {
       // match the actual orbit shape, so hide it to avoid a misleading line.
       s.orbitLine.visible = nextMode === "sim";
     }
-    if (s.control && s.control.mode !== nextMode && s.trailPoints) {
-      // Clear the trail on a sim<->live switch so it doesn't draw a straight
-      // line connecting two unrelated trajectories.
+    // Editing the orbit elements would otherwise leave a tangle of trail /
+    // ground-track segments from every intermediate orbit. On an actual change,
+    // wipe the past trail + tracks and let the loop redraw the forward path
+    // fresh for the new orbit (the blue preview ellipse already updated above).
+    const orbitElChanged = prevOrbitElRef.current !== null && prevOrbitElRef.current !== orbitEl;
+    prevOrbitElRef.current = orbitEl;
+
+    // Clear the trail on a sim<->live switch, on entering/leaving a timeline
+    // scrub, or on an orbit-element edit — anything that makes a connecting
+    // line between unrelated states meaningless.
+    const scrubChanged = s.control && (s.control.scrubTime == null) !== (scrubTime == null);
+    if (s.control && (s.control.mode !== nextMode || scrubChanged || orbitElChanged) && s.trailPoints) {
       s.trailPoints.length = 0;
       if (s.trailLine) s.trailLine.geometry.setDrawRange(0, 0);
       groundTrackRef.current = [];
+      futureGroundTrackRef.current = [];
     }
     s.control = {
       running,
@@ -809,9 +887,17 @@ export default function OrbitViewer() {
       onTelem: setTelem,
       period,
       showFuture,
+      showCountries,
+      followSat,
+      reverse,
+      scrubTime: linkState === "LIVE" ? null : scrubTime,
+      // bumped on every orbit-element edit so the loop recomputes the forward
+      // trajectory immediately instead of on its 3 s timer.
+      futureNonce: (s.control?.futureNonce || 0) + (orbitElChanged ? 1 : 0),
+      resetNonce: missionResetKey,
     };
     if (!showFuture && s.futureLine) { s.futureLine.visible = false; futureGroundTrackRef.current = []; }
-  }, [orbitEl, speed, running, linkState, rebuildElements, showAxes, showSun, showFuture]);
+  }, [orbitEl, speed, running, linkState, rebuildElements, showAxes, showSun, showBodies, showFuture, showCountries, showLabels, followSat, scrubTime, reverse, showEcef, showSunVector, showMagVector, showProjection, missionResetKey]);
 
   // ---- WebSocket bridge (optional live mode) --------------------------------
   const connect = () => {
@@ -825,7 +911,17 @@ export default function OrbitViewer() {
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data);
-          if (msg.node) setNodeName(msg.node);
+          if (msg.node) {
+            setNodeName(msg.node);
+            // Register a newly-seen node under the currently-selected realm.
+            const rlm = realmRef.current;
+            setNodesByRealm((m) => {
+              const cur = m[rlm] || [];
+              return cur.includes(msg.node) ? m : { ...m, [rlm]: [...cur, msg.node] };
+            });
+          }
+          // Attitude quaternion, when present, drives the Satellite view's model.
+          if (msg.alphaatt && typeof msg.alphaatt.w === "number") attitudeRef.current = msg.alphaatt;
           // propagatorv3 serializes ecipos as a full `cartpos` struct, not a
           // flat {x,y,z}: { utc, s:{col:[x,y,z]}, v:{col:[...]}, a:{col:[...]} }
           // — positions in meters (SI). The bridge already normalizes
@@ -855,6 +951,34 @@ export default function OrbitViewer() {
     wsRef.current = null;
     setLinkState("SIMULATED");
   };
+
+  // Snap the 3D camera back to its default distance/angle and stop following.
+  const resetView = useCallback(() => {
+    setFollowSat(false);
+    sceneRef.current.resetView?.();
+    sceneRef.current.updateCamera?.();
+  }, []);
+
+  // Reset the mission clock to the epoch (t=0) and clear the trails.
+  const resetMission = useCallback(() => {
+    setScrubTime(null);
+    setReverse(false);
+    groundTrackRef.current = [];
+    futureGroundTrackRef.current = [];
+    setMissionResetKey((k) => k + 1);
+  }, []);
+
+  // Jump the timeline one step (a fraction of the current orbital period)
+  // forward (+1) or back (-1), freezing playback at that point.
+  const stepMission = useCallback((dir) => {
+    const aKm = elementsRef.current?.aKm || EARTH_RADIUS_KM + 550;
+    const periodSec = (2 * Math.PI) / Math.sqrt(MU_EARTH / (aKm * aKm * aKm));
+    const step = Math.max(30, periodSec / 24); // ~15° of orbit
+    setScrubTime((prev) => {
+      const base = prev == null ? (telemRef.current?.simSec || 0) : prev;
+      return Math.max(0, base + dir * step);
+    });
+  }, []);
 
   // ---- 2D map view (Mercator) -----------------------------------------------
   const map2dCanvasRef = useRef(null);
@@ -1067,18 +1191,33 @@ export default function OrbitViewer() {
         ctx.beginPath(); ctx.arc(sp.x, sp.y, 4, 0, Math.PI * 2); ctx.fill();
       }
 
-      // Ground station
-      const gs = latLonToMercatorPx(HAWAII_GROUND_STATION.lat, HAWAII_GROUND_STATION.lon, w, h);
-      ctx.fillStyle = "#5eff9c";
-      ctx.beginPath(); ctx.arc(gs.x, gs.y, 4, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = "#cfe6ff";
-      ctx.font = "11px monospace";
-      ctx.fillText(HAWAII_GROUND_STATION.name, gs.x + 8, gs.y - 6);
+      // Ground stations — plus a line to the sub-satellite point during a pass.
+      const satEci = t ? { x: t.x, y: t.y, z: t.z } : null;
+      const satGP = t ? eciToLatLon(t.x, t.y, t.z, t.mjd) : null;
+      for (const station of groundStationsRef.current) {
+        if (station.enabled === false) continue;
+        const slat = numOr(station.lat), slon = numOr(station.lon), salt = Math.max(0, numOr(station.alt));
+        const gsPx = latLonToMercatorPx(slat, slon, w, h);
+        let inView = false;
+        if (satEci) {
+          inView = elevationDeg(satEci, groundStationEci(slat, slon, salt, t.mjd)) >= GS_ELEVATION_MASK_DEG;
+        }
+        if (inView && satGP) {
+          const satPx = latLonToMercatorPx(satGP.lat, satGP.lon, w, h);
+          ctx.strokeStyle = "rgba(94,255,156,0.8)";
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(gsPx.x, gsPx.y); ctx.lineTo(satPx.x, satPx.y); ctx.stroke();
+        }
+        ctx.fillStyle = inView ? "#5eff9c" : "#3f8f66";
+        ctx.beginPath(); ctx.arc(gsPx.x, gsPx.y, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#cfe6ff";
+        ctx.font = "11px monospace";
+        ctx.fillText(station.name || "station", gsPx.x + 8, gsPx.y - 6);
+      }
 
       // Current satellite position
-      if (t) {
-        const { lat, lon } = eciToLatLon(t.x, t.y, t.z, t.mjd);
-        const p = latLonToMercatorPx(lat, lon, w, h);
+      if (satGP) {
+        const p = latLonToMercatorPx(satGP.lat, satGP.lon, w, h);
         ctx.fillStyle = "#ffeb3b";
         ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = "#ffeb3b";
@@ -1090,13 +1229,456 @@ export default function OrbitViewer() {
     return () => cancelAnimationFrame(raf);
   }, [activeView]);
 
-  const linkColor = { LIVE: "#5ee6a8", CONNECTING: "#ffb454", ERROR: "#ff6a6a", SIMULATED: "#8fd7ff" }[linkState];
+  // ---- Satellite 3D view — close-up render of the spacecraft ---------------
+  // Its own Three.js scene (independent of the orbit scene above), set up when
+  // the tab is opened and torn down when it's left. Orientation follows live
+  // attitude telemetry (alphaatt) when connected, otherwise a slow spin.
+  useEffect(() => {
+    if (activeView !== "satellite") return;
+    const mount = satMountRef.current;
+    if (!mount) return;
+    const width = mount.clientWidth, height = mount.clientHeight;
 
-  const VIEW_TABS = [
-    { id: "3d", label: "3D View" },
-    { id: "2d", label: "2D View" },
-    { id: "telemetry", label: "Telemetry" },
-  ];
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.01, 4000);
+    let camDist = 12, camTheta = 0.9, camPhi = 1.05;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    mount.appendChild(renderer.domElement);
+
+    scene.add(buildStarfield(1600));
+
+    scene.add(new THREE.AmbientLight(0x30405c, 1.2));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
+    keyLight.position.set(6, 4, 8);
+    scene.add(keyLight);
+    const fillLight = new THREE.DirectionalLight(0x88aaff, 0.4);
+    fillLight.position.set(-8, -3, -6);
+    scene.add(fillLight);
+
+    const earthTex = sceneRef.current.earthMat?.map || null;
+
+    // Rotation-mode backdrop: a faint Earth limb far "below".
+    const bgEarth = new THREE.Mesh(
+      new THREE.SphereGeometry(115, 48, 48),
+      earthTex
+        ? new THREE.MeshBasicMaterial({ map: earthTex, transparent: true, opacity: 0.5 })
+        : new THREE.MeshBasicMaterial({ color: 0x1a3a6b, transparent: true, opacity: 0.4 })
+    );
+    bgEarth.position.set(0, -150, -55);
+    scene.add(bgEarth);
+
+    // Flight-mode Earth: real scene scale at the origin, so the spacecraft flies
+    // around it exactly where the 3D Orbit view shows it.
+    const SAT_EARTH_R = kmToScene(EARTH_RADIUS_KM);
+    const flightEarth = new THREE.Mesh(
+      new THREE.SphereGeometry(SAT_EARTH_R, 48, 48),
+      earthTex
+        ? new THREE.MeshPhongMaterial({ map: earthTex, shininess: 6 })
+        : new THREE.MeshPhongMaterial({ color: 0x1a3a6b, shininess: 6 })
+    );
+    flightEarth.visible = false;
+    scene.add(flightEarth);
+
+    // Visible Sun + Moon bodies for the flight (orbital / attitude) modes, so
+    // the spacecraft is seen against the same sky as the 3D Orbit view. Sun far
+    // along the true Sun direction; Moon at its real geocentric distance.
+    const SAT_SUN_DIST = 1400;
+    const satSunBody = new THREE.Group();
+    satSunBody.add(new THREE.Mesh(
+      new THREE.SphereGeometry(SAT_EARTH_R * 6, 32, 32),
+      new THREE.MeshBasicMaterial({ color: 0xffe066 })
+    ));
+    satSunBody.add(new THREE.Mesh(
+      new THREE.SphereGeometry(SAT_EARTH_R * 10, 32, 32),
+      new THREE.MeshBasicMaterial({ color: 0xffd24a, transparent: true, opacity: 0.18, depthWrite: false })
+    ));
+    satSunBody.add(makeAxisLabel("☀ Sun", "#ffe066", false, SAT_EARTH_R * 14));
+    satSunBody.children[2].position.set(0, SAT_EARTH_R * 18, 0);
+    satSunBody.visible = false;
+    scene.add(satSunBody);
+
+    const satMoonBody = new THREE.Group();
+    satMoonBody.add(new THREE.Mesh(
+      new THREE.SphereGeometry(SAT_EARTH_R * 0.9, 32, 32),
+      new THREE.MeshPhongMaterial({ color: 0xcfd2d6, shininess: 2 })
+    ));
+    satMoonBody.add(makeAxisLabel("☾ Moon", "#cfd2d6", false, SAT_EARTH_R * 2));
+    satMoonBody.children[1].position.set(0, SAT_EARTH_R * 2.4, 0);
+    satMoonBody.visible = false;
+    scene.add(satMoonBody);
+
+    const model = buildSatModel(satModel);
+    scene.add(model);
+
+    // Attitude reference sphere: 3 principal great circles + a lat/lon grid
+    // every 30°. Base radius 1 so scene.scale directly gives the sphere size.
+    const attSphere = new THREE.Group();
+    const ATT_R = 1;
+    attSphere.add(new THREE.Mesh(
+      new THREE.SphereGeometry(ATT_R * 0.995, 24, 16),
+      new THREE.MeshBasicMaterial({ color: 0x3fa9ff, wireframe: true, transparent: true, opacity: 0.06 })
+    ));
+    const ring = (plane, color, opacity) => {
+      const pts = [];
+      for (let i = 0; i <= 128; i++) {
+        const a = (i / 128) * Math.PI * 2, c = Math.cos(a) * ATT_R, s = Math.sin(a) * ATT_R;
+        pts.push(plane === "xz" ? new THREE.Vector3(c, 0, s)
+          : plane === "xy" ? new THREE.Vector3(c, s, 0)
+          : new THREE.Vector3(0, c, s));
+      }
+      return new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts),
+        new THREE.LineBasicMaterial({ color, transparent: true, opacity }));
+    };
+    attSphere.add(ring("xz", 0x5c9cff, 0.5), ring("xy", 0x3fa9ff, 0.22), ring("yz", 0x3fa9ff, 0.22));
+
+    // Latitude / longitude grid every 30° (Y is the polar axis).
+    const gridMat = new THREE.LineBasicMaterial({ color: 0x6fb6ff, transparent: true, opacity: 0.16 });
+    for (let latDeg = -60; latDeg <= 60; latDeg += 30) {
+      if (latDeg === 0) continue; // equator is the xz great circle above
+      const lat = (latDeg * Math.PI) / 180, rr = ATT_R * Math.cos(lat), yy = ATT_R * Math.sin(lat);
+      const pts = [];
+      for (let i = 0; i <= 96; i++) { const a = (i / 96) * Math.PI * 2; pts.push(new THREE.Vector3(rr * Math.cos(a), yy, rr * Math.sin(a))); }
+      attSphere.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), gridMat));
+    }
+    for (let lonDeg = 0; lonDeg < 180; lonDeg += 30) {
+      const lon = (lonDeg * Math.PI) / 180, pts = [];
+      for (let i = 0; i <= 96; i++) {
+        const u = (i / 96) * Math.PI * 2;
+        pts.push(new THREE.Vector3(ATT_R * Math.sin(u) * Math.cos(lon), ATT_R * Math.cos(u), ATT_R * Math.sin(u) * Math.sin(lon)));
+      }
+      attSphere.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), gridMat));
+    }
+
+    // Celestial-coordinate tick labels: right ascension around the equator
+    // (0° at +X, increasing toward +Z), declination up the RA=0 meridian.
+    const skyLabel = (txt, x, y, z, size = ATT_R * 0.075) => {
+      const l = makeAxisLabel(txt, "#7fb6ff", false, size);
+      l.position.set(x, y, z);
+      attSphere.add(l);
+    };
+    for (let ra = 0; ra < 360; ra += 60) {
+      const a = (ra * Math.PI) / 180;
+      skyLabel(`${ra}°`, ATT_R * 1.06 * Math.cos(a), 0, ATT_R * 1.06 * Math.sin(a));
+    }
+    for (const dec of [-60, -30, 30, 60]) {
+      const d = (dec * Math.PI) / 180;
+      skyLabel(`${dec > 0 ? "+" : ""}${dec}°`, ATT_R * 1.06 * Math.cos(d), ATT_R * 1.06 * Math.sin(d), 0);
+    }
+    skyLabel("RA", ATT_R * 1.24, 0, 0, ATT_R * 0.09);
+    skyLabel("Dec +90°", 0, ATT_R * 1.16, 0, ATT_R * 0.09);
+    scene.add(attSphere);
+
+    // Axis triads. Body triad is a child of the model (tracks its orientation);
+    // inertial triad is a child of the scene (never rotates) and is moved to
+    // the model's position each frame so the two can be compared.
+    const makeTriad = (colors, len) => {
+      const g = new THREE.Group();
+      [
+        [new THREE.Vector3(1, 0, 0), colors[0], "X"],
+        [new THREE.Vector3(0, 1, 0), colors[1], "Y"],
+        [new THREE.Vector3(0, 0, 1), colors[2], "Z"],
+      ].forEach(([d, c, t]) => {
+        g.add(new THREE.ArrowHelper(d, new THREE.Vector3(), len, c, len * 0.16, len * 0.09));
+        const lbl = makeAxisLabel(t, `#${c.toString(16).padStart(6, "0")}`, false, len * 0.24);
+        lbl.position.copy(d.clone().multiplyScalar(len * 1.14));
+        g.add(lbl);
+      });
+      return g;
+    };
+    const TRIAD_LEN = 2.6;
+    const bodyTriad = makeTriad([0xff5c5c, 0x5cff8a, 0x5c9cff], TRIAD_LEN);
+    model.add(bodyTriad); // scales with the model
+    // Same base length; scaled per-frame to match the (scaled) body triad.
+    const inertialTriad = makeTriad([0xff9c9c, 0x9cffc0, 0x9cc4ff], TRIAD_LEN);
+    inertialTriad.visible = false;
+    scene.add(inertialTriad);
+
+    // Flight-mode orbit ellipse, rebuilt from the current elements.
+    const satOrbitGeo = new THREE.BufferGeometry();
+    const satOrbitLine = new THREE.LineLoop(satOrbitGeo, new THREE.LineBasicMaterial({ color: 0x8fd7ff, transparent: true, opacity: 0.4 }));
+    satOrbitLine.visible = false;
+    scene.add(satOrbitLine);
+    let lastOrbitBuild = 0;
+
+    // Sun / magnetic-field vectors at the spacecraft (flight modes only).
+    const vecArrow = (color, label) => {
+      const a = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(), 3.4, color, 0.5, 0.28);
+      const lbl = makeAxisLabel(label, `#${color.toString(16).padStart(6, "0")}`, false, 0.7);
+      lbl.position.set(0, 3.7, 0);
+      a.add(lbl);
+      a.visible = false;
+      return a;
+    };
+    const satSunArrow = vecArrow(0xffe066, "☀ Sun");
+    const satMagArrow = vecArrow(0xff6ec7, "B");
+    scene.add(satSunArrow, satMagArrow);
+
+    // ECI -> scene-frame remap for raw telemetry attitude quaternions.
+    const R = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+    const Rinv = R.clone().invert();
+    const _yAxis = new THREE.Vector3(0, 1, 0);
+    const qTmp = new THREE.Quaternion();
+    const qTarget = new THREE.Quaternion();
+    const qRead = new THREE.Quaternion();
+    const eulRead = new THREE.Euler();
+    const _p = new THREE.Vector3(), _nadir = new THREE.Vector3(), _vel = new THREE.Vector3();
+    const _bx = new THREE.Vector3(), _by = new THREE.Vector3(), _bz = new THREE.Vector3();
+    const _sun = new THREE.Vector3(), _magR = new THREE.Vector3(), _magB = new THREE.Vector3();
+    const _magBody = new THREE.Vector3(), _sunBody = new THREE.Vector3(), _qInv = new THREE.Quaternion();
+    const _mBasis = new THREE.Matrix4();
+    let lastAttPush = 0;
+    let lastMode = null;
+
+    let dragging = false, lastX = 0, lastY = 0, touchCount = 0, pinchPrev = 0;
+    const onDown = (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; };
+    const onUp = () => { dragging = false; };
+    const onMove = (e) => {
+      if (!dragging || touchCount >= 2) return;
+      const dx = e.clientX - lastX, dy = e.clientY - lastY;
+      lastX = e.clientX; lastY = e.clientY;
+      camTheta += dx * 0.005;
+      camPhi = Math.min(Math.max(camPhi - dy * 0.005, 0.15), Math.PI - 0.15);
+    };
+    const onWheel = (e) => {
+      e.preventDefault();
+      camDist = Math.min(Math.max(camDist + e.deltaY * 0.02, 3), 70);
+    };
+    const pinchGap = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const onTouchStart = (e) => {
+      touchCount = e.touches.length;
+      if (touchCount >= 2) { dragging = false; pinchPrev = pinchGap(e.touches); }
+    };
+    const onTouchMove = (e) => {
+      if (e.touches.length < 2) return;
+      e.preventDefault();
+      const gap = pinchGap(e.touches);
+      if (pinchPrev) camDist = Math.min(Math.max(camDist + (pinchPrev - gap) * 0.05, 3), 70);
+      pinchPrev = gap;
+    };
+    const onTouchEnd = (e) => {
+      touchCount = e.touches.length;
+      if (touchCount < 2) pinchPrev = 0;
+    };
+    renderer.domElement.style.touchAction = "none";
+    renderer.domElement.addEventListener("pointerdown", onDown);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointermove", onMove);
+    renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+    renderer.domElement.addEventListener("touchstart", onTouchStart, { passive: false });
+    renderer.domElement.addEventListener("touchmove", onTouchMove, { passive: false });
+    renderer.domElement.addEventListener("touchend", onTouchEnd);
+    renderer.domElement.addEventListener("touchcancel", onTouchEnd);
+
+    let raf;
+    let lastFrame = performance.now();
+    let spin = 0;
+    const animate = () => {
+      raf = requestAnimationFrame(animate);
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - lastFrame) / 1000);
+      lastFrame = now;
+
+      const ctl = satCtlRef.current;
+      const isRunning = ctl.running;
+      const link = ctl.linkState;
+      const mode = ctl.mode || "turntable";
+      const t = telemRef.current;
+      const att = attitudeRef.current;
+      const liveAtt = link === "LIVE" && att;
+      const flying = (mode === "orbital" || mode === "attitude") && t;
+
+      // Re-frame the camera on a mode switch.
+      if (mode !== lastMode) {
+        lastMode = mode;
+        camDist = mode === "orbital" ? 18 : mode === "attitude" ? 9 : 12;
+        camTheta = 0.9; camPhi = 1.05;
+      }
+
+      bodyTriad.visible = !!ctl.bodyAxes;
+      inertialTriad.visible = !!ctl.inertialAxes;
+
+      let src;
+      if (flying) {
+        flightEarth.visible = true;
+        bgEarth.visible = false;
+        satOrbitLine.visible = mode === "orbital";
+        flightEarth.rotation.y = gmstRadians(t.mjd);
+
+        _p.set(kmToScene(t.x), kmToScene(t.z), -kmToScene(t.y));
+        model.position.copy(_p);
+        model.scale.setScalar(ctl.modelScale || 0.22);
+        inertialTriad.position.copy(_p);
+        inertialTriad.scale.setScalar(ctl.modelScale || 0.22); // match the (scaled) body triad
+
+        // Nominal flight attitude: body +Z -> nadir, body +X -> velocity.
+        _nadir.copy(_p).multiplyScalar(-1).normalize();
+        _vel.set(t.vx, t.vz, -t.vy);
+        if (_vel.lengthSq() < 1e-9) _vel.set(1, 0, 0);
+        _vel.normalize();
+        _bz.copy(_nadir);
+        _bx.copy(_vel).addScaledVector(_bz, -_vel.dot(_bz));
+        if (_bx.lengthSq() < 1e-9) _bx.set(1, 0, 0); else _bx.normalize();
+        _by.copy(_bz).cross(_bx).normalize(); // Y = Z x X (right-handed)
+        _mBasis.makeBasis(_bx, _by, _bz);
+        model.quaternion.setFromRotationMatrix(_mBasis);
+
+        // Magnetic-field direction (world) and its body-frame components, for
+        // the arrow and the Attitude Telemetry readout.
+        _magR.copy(_p).normalize();
+        {
+          const mDotR = -_magR.y;
+          _magB.set(3 * mDotR * _magR.x, 3 * mDotR * _magR.y + 1, 3 * mDotR * _magR.z).normalize();
+        }
+        _qInv.copy(model.quaternion).invert();
+        _magBody.copy(_magB).applyQuaternion(_qInv);
+
+        // Sun direction (world), and its body-frame components.
+        {
+          const sub = getSubsolarPoint(t.mjd);
+          _sun.copy(latLonToVector3(sub.lat, sub.lon, 1)).applyAxisAngle(_yAxis, gmstRadians(t.mjd)).normalize();
+        }
+        _sunBody.copy(_sun).applyQuaternion(_qInv);
+
+        // Attitude sphere: around the spacecraft in "attitude" mode (sized to
+        // the model), origin + turntable radius otherwise.
+        if (mode === "attitude") {
+          attSphere.visible = true;
+          attSphere.position.copy(_p);
+          attSphere.scale.setScalar(2 * (ctl.attScale || 1));
+        } else {
+          attSphere.visible = false;
+        }
+
+        if (now - lastOrbitBuild > 1500 && elementsRef.current) {
+          lastOrbitBuild = now;
+          try {
+            const path = precomputeOrbitPath(elementsRef.current, 200);
+            satOrbitGeo.setFromPoints(path.pts);
+          } catch (e) { /* skip */ }
+        }
+
+        camera.position.set(
+          _p.x + camDist * Math.sin(camPhi) * Math.cos(camTheta),
+          _p.y + camDist * Math.cos(camPhi),
+          _p.z + camDist * Math.sin(camPhi) * Math.sin(camTheta)
+        );
+        camera.lookAt(_p);
+        src = mode === "attitude" ? "attitude · Z→nadir / X→vel" : "orbital · Z→nadir / X→vel";
+      } else {
+        flightEarth.visible = false;
+        bgEarth.visible = true;
+        attSphere.visible = true;
+        attSphere.position.set(0, 0, 0);
+        attSphere.scale.setScalar(6 * (ctl.attScale || 1));
+        satOrbitLine.visible = false;
+        model.position.set(0, 0, 0);
+        model.scale.setScalar(1);
+        inertialTriad.position.set(0, 0, 0);
+        inertialTriad.scale.setScalar(1);
+
+        if (liveAtt) {
+          qTmp.set(att.x, att.y, att.z, att.w).normalize();
+          qTarget.copy(R).multiply(qTmp).multiply(Rinv);
+          model.quaternion.slerp(qTarget, Math.min(1, dt * 4));
+          src = "turntable · live attitude";
+        } else if (isRunning) {
+          spin += dt * 0.35;
+          model.quaternion.setFromEuler(new THREE.Euler(0.15, spin, 0));
+          src = "turntable · presentation spin";
+        } else {
+          src = "turntable · paused";
+        }
+
+        camera.position.set(
+          camDist * Math.sin(camPhi) * Math.cos(camTheta),
+          camDist * Math.cos(camPhi),
+          camDist * Math.sin(camPhi) * Math.sin(camTheta)
+        );
+        camera.lookAt(0, 0, 0);
+      }
+
+      // Sun / magnetic-field vectors (flight modes only). Scaled to the same
+      // on-screen size as the body triad (2.6 units at the model's scale).
+      satSunArrow.visible = flying && !!ctl.sunVec;
+      satMagArrow.visible = flying && !!ctl.magVec;
+      const vecScale = (2.6 * (ctl.modelScale || 0.22)) / 3.4;
+      if (satSunArrow.visible) {
+        satSunArrow.position.copy(_p);
+        satSunArrow.scale.setScalar(vecScale);
+        satSunArrow.setDirection(_sun); // _sun set above in the flying branch
+      }
+      if (satMagArrow.visible) {
+        satMagArrow.position.copy(_p);
+        satMagArrow.scale.setScalar(vecScale);
+        satMagArrow.setDirection(_magB); // _magB set above in the flying branch
+      }
+
+      // Visible Sun + Moon bodies — flight modes only (the turntable is an
+      // abstract presentation with no real sky around it).
+      satSunBody.visible = flying;
+      satMoonBody.visible = flying;
+      if (flying) {
+        satSunBody.position.copy(_sun).multiplyScalar(SAT_SUN_DIST); // _sun = world Sun unit vec
+        const mm = getMoonEci(t.mjd);
+        satMoonBody.position.set(kmToScene(mm.x), kmToScene(mm.z), -kmToScene(mm.y));
+      }
+
+      // Publish attitude (~6 Hz) for the readout, incl. body-frame B and Sun.
+      if (now - lastAttPush > 160) {
+        lastAttPush = now;
+        qRead.copy(model.quaternion);
+        eulRead.setFromQuaternion(qRead, "ZYX");
+        setSatAtt({
+          w: qRead.w, x: qRead.x, y: qRead.y, z: qRead.z,
+          roll: THREE.MathUtils.radToDeg(eulRead.x),
+          pitch: THREE.MathUtils.radToDeg(eulRead.y),
+          yaw: THREE.MathUtils.radToDeg(eulRead.z),
+          src,
+          mag: flying ? { x: _magBody.x, y: _magBody.y, z: _magBody.z } : null,
+          sun: flying ? { x: _sunBody.x, y: _sunBody.y, z: _sunBody.z } : null,
+        });
+      }
+
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    const onResize = () => {
+      const w = mount.clientWidth, h = mount.clientHeight;
+      camera.aspect = w / h; camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    };
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", onResize);
+      renderer.domElement.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointermove", onMove);
+      renderer.domElement.removeEventListener("wheel", onWheel);
+      renderer.domElement.removeEventListener("touchstart", onTouchStart);
+      renderer.domElement.removeEventListener("touchmove", onTouchMove);
+      renderer.domElement.removeEventListener("touchend", onTouchEnd);
+      renderer.domElement.removeEventListener("touchcancel", onTouchEnd);
+      scene.traverse((obj) => {
+        if (obj.isMesh || obj.isPoints || obj.isLine) obj.geometry?.dispose();
+        const m = obj.material;
+        (Array.isArray(m) ? m : m ? [m] : []).forEach((mm) => {
+          if (mm.map && mm.map !== earthTex) mm.map.dispose();
+          mm.dispose();
+        });
+      });
+      renderer.dispose();
+      if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, satModel]);
+
+  const linkColor = { LIVE: "#5ee6a8", CONNECTING: "#ffb454", ERROR: "#ff6a6a", SIMULATED: "#8fd7ff" }[linkState];
 
   const renderControlsPanelContent = (include3DOnlyToggles) => (
     <>
@@ -1118,25 +1700,67 @@ export default function OrbitViewer() {
         </div>
       ))}
 
-      <div style={{ display: "flex", gap: 8, marginTop: 10, marginBottom: 10 }}>
+      <div style={{ display: "flex", gap: 8, marginTop: 10, marginBottom: 6 }}>
+        <button
+          onClick={() => setReverse((r) => !r)}
+          title="Playback direction"
+          style={{
+            ...btnStyle,
+            background: reverse ? "rgba(255,180,84,0.22)" : "rgba(143,215,255,0.1)",
+            border: `1px solid ${reverse ? "rgba(255,180,84,0.6)" : "rgba(143,215,255,0.3)"}`,
+            color: reverse ? "#ffd9b0" : "#cfe6ff",
+          }}
+        >
+          {reverse ? "◀ Reverse" : "▶ Forward"}
+        </button>
         <button onClick={() => setRunning((r) => !r)} style={btnStyle}>{running ? "Pause" : "Resume"}</button>
-        <div style={{ flex: 1 }}>
-          <input type="range" min={1} max={600} value={speed} onChange={(e) => setSpeed(e.target.value)} style={{ width: "100%" }} />
-          <div style={{ fontSize: 10, color: "#5f7396", textAlign: "right" }}>{speed}x</div>
-        </div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <input type="range" min={1} max={600} value={speed} onChange={(e) => setSpeed(e.target.value)} style={{ flex: 1 }} />
+        <span style={{ fontSize: 10, color: "#5f7396", minWidth: 34, textAlign: "right" }}>{speed}x</span>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <button onClick={resetMission} style={btnStyle}>⟲ Reset mission</button>
       </div>
 
       {include3DOnlyToggles && (
         <>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8fa2c2", marginBottom: 10, cursor: "pointer" }}>
-            <input type="checkbox" checked={showAxes} onChange={(e) => setShowAxes(e.target.checked)} />
-            Show ECI reference frame
-          </label>
+          {[
+            ["ECI reference frame", showAxes, setShowAxes],
+            ["ECEF reference frame", showEcef, setShowEcef],
+            ["Sun & Moon bodies", showBodies, setShowBodies],
+            ["Sun vector", showSunVector, setShowSunVector],
+            ["Magnetic vector", showMagVector, setShowMagVector],
+            ["Sub-satellite point (projection)", showProjection, setShowProjection],
+            ["Country boundaries + labels", showCountries, setShowCountries],
+            ["Ground-station & frame labels", showLabels, setShowLabels],
+          ].map(([label, val, set]) => (
+            <label key={label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8fa2c2", marginBottom: 10, cursor: "pointer" }}>
+              <input type="checkbox" checked={val} onChange={(e) => set(e.target.checked)} />
+              {label}
+            </label>
+          ))}
 
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8fa2c2", marginBottom: 10, cursor: "pointer" }}>
             <input type="checkbox" checked={showSun} onChange={(e) => setShowSun(e.target.checked)} />
-            Sun {showSun ? "on" : "off (full visibility)"}
+            Sunlight {showSun ? "on" : "off (full visibility)"}
           </label>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <button
+              onClick={() => setFollowSat((f) => !f)}
+              style={{
+                ...btnStyle,
+                background: followSat ? "rgba(143,215,255,0.28)" : "rgba(143,215,255,0.1)",
+                border: `1px solid ${followSat ? "rgba(143,215,255,0.7)" : "rgba(143,215,255,0.3)"}`,
+                color: followSat ? "#eaf3ff" : "#cfe6ff",
+              }}
+            >
+              {followSat ? "Following ✓" : "Follow satellite"}
+            </button>
+            <button onClick={resetView} style={btnStyle}>Reset view</button>
+          </div>
         </>
       )}
 
@@ -1145,7 +1769,7 @@ export default function OrbitViewer() {
         Show future trajectory
       </label>
 
-      <div style={{ fontSize: 11, color: "#7d93b8", margin: "10px 0 6px", fontFamily: "system-ui,sans-serif" }}>LIVE BRIDGE</div>
+      <div style={{ fontSize: 11, color: "#7d93b8", margin: "10px 0 6px", fontFamily: "system-ui,sans-serif" }}>LIVE TELEMETRY (COSMOS SERVER)</div>
       <input placeholder="ws://localhost:8080/telem" value={wsUrl} onChange={(e) => setWsUrl(e.target.value)}
         style={{ width: "100%", background: "#0c1428", border: "1px solid rgba(143,215,255,0.25)", color: "#cfe6ff", borderRadius: 4, padding: "6px 8px", fontSize: 12, marginBottom: 8 }} />
       <div style={{ display: "flex", gap: 8 }}>
@@ -1155,25 +1779,266 @@ export default function OrbitViewer() {
     </>
   );
 
+  // The controls "dock": a floating glass panel on desktop (collapsible to its
+  // header so more of the scene is visible), a bottom sheet on mobile.
+  // `bottomPx` lifts it clear of the mission-timeline bar on the orbit views.
+  const renderControlsDock = (include3DOnlyToggles, bottomPx = 22) => {
+    if (!isMobile) {
+      return (
+        <div style={{
+          position: "absolute", right: 22, bottom: bottomPx, width: controlsCollapsed ? "auto" : 280,
+          maxHeight: `calc(100% - ${bottomPx + 22}px)`, overflowY: "auto",
+          background: "rgba(9,14,28,0.72)", border: "1px solid rgba(143,215,255,0.18)",
+          borderRadius: 6, padding: "12px 16px", backdropFilter: "blur(4px)",
+        }}>
+          <div
+            onClick={() => setControlsCollapsed((c) => !c)}
+            style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 18, cursor: "pointer" }}
+          >
+            <span style={{ fontSize: 11, color: "#7d93b8", fontFamily: "system-ui,sans-serif", letterSpacing: 0.5 }}>ORBIT CONTROL DISPLAY</span>
+            <span style={{ fontSize: 12, color: "#8fa2c2" }}>{controlsCollapsed ? "▸" : "▾"}</span>
+          </div>
+          {!controlsCollapsed && (
+            <div style={{ marginTop: 10 }}>{renderControlsPanelContent(include3DOnlyToggles)}</div>
+          )}
+        </div>
+      );
+    }
+    return (
+      <>
+        {!panelOpen && (
+          <button
+            onClick={() => setPanelOpen(true)}
+            style={{
+              position: "absolute", right: 12, bottom: bottomPx - 10, zIndex: 6,
+              background: "rgba(9,14,28,0.92)", border: "1px solid rgba(143,215,255,0.35)",
+              color: "#eaf3ff", borderRadius: 999, padding: "10px 18px", fontSize: 13,
+              fontFamily: "'IBM Plex Mono',monospace", boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+            }}
+          >
+            ☰ Orbit Controls
+          </button>
+        )}
+        {panelOpen && (
+          <>
+            <div
+              onClick={() => setPanelOpen(false)}
+              style={{ position: "absolute", inset: 0, background: "rgba(3,6,12,0.5)", zIndex: 6 }}
+            />
+            <div style={{
+              position: "absolute", left: 0, right: 0, bottom: 0, zIndex: 7,
+              maxHeight: "72%", overflowY: "auto", WebkitOverflowScrolling: "touch",
+              background: "rgba(9,14,28,0.98)", borderTop: "1px solid rgba(143,215,255,0.3)",
+              borderRadius: "16px 16px 0 0", padding: "8px 18px 24px",
+            }}>
+              <div style={{
+                position: "sticky", top: 0, background: "rgba(9,14,28,0.98)",
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                padding: "6px 0 10px",
+              }}>
+                <div style={{ width: 36, height: 4, borderRadius: 2, background: "rgba(143,215,255,0.35)", position: "absolute", left: "50%", transform: "translateX(-50%)", top: 0 }} />
+                <span style={{ fontSize: 12, color: "#7d93b8", fontFamily: "system-ui,sans-serif", letterSpacing: 0.5 }}>ORBIT CONTROL DISPLAY</span>
+                <button
+                  onClick={() => setPanelOpen(false)}
+                  style={{ background: "transparent", border: "none", color: "#8fa2c2", fontSize: 20, lineHeight: 1, padding: "2px 6px", cursor: "pointer" }}
+                >
+                  ✕
+                </button>
+              </div>
+              {renderControlsPanelContent(include3DOnlyToggles)}
+            </div>
+          </>
+        )}
+      </>
+    );
+  };
+
+  // Full-width mission-timeline scrubber pinned to the bottom of the orbit
+  // views — wide, for fine control over which slice of the orbit to analyse.
+  const renderTimelineBar = () => {
+    const nowSec = telem.simSec || 0;
+    const cur = scrubTime == null ? nowSec : scrubTime;
+    const tlMax = Math.max(4 * 3600, Math.ceil((cur + 3600) / 300) * 300);
+    // Same number of discrete steps as the speed selector (1×…600×) → 600.
+    const tlStep = Math.max(1, Math.round(tlMax / 600));
+    const live = linkState === "LIVE";
+    const sbtn = { ...btnStyle, flex: "none", padding: "5px 9px", fontSize: 11 };
+    return (
+      <div style={{
+        position: "absolute", left: 0, right: 0, bottom: 0, zIndex: 4,
+        display: "flex", alignItems: "center", gap: isMobile ? 8 : 14, flexWrap: "wrap",
+        padding: isMobile ? "8px 10px" : "9px 18px",
+        background: "rgba(9,14,28,0.85)", borderTop: "1px solid rgba(143,215,255,0.15)",
+        backdropFilter: "blur(4px)", opacity: live ? 0.55 : 1,
+      }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, whiteSpace: "nowrap" }}>
+          <span style={{ fontSize: 10, letterSpacing: 0.5, color: "#7d93b8", fontFamily: "system-ui,sans-serif" }}>MISSION TIMELINE</span>
+          <span style={{ fontSize: 13, color: "#ffb454", fontVariantNumeric: "tabular-nums" }}>{fmtDuration(cur)}</span>
+        </div>
+        <input
+          type="range" min={0} max={tlMax} step={tlStep}
+          value={Math.min(cur, tlMax)}
+          disabled={live}
+          onChange={(e) => setScrubTime(Number(e.target.value))}
+          style={{ flex: 1, minWidth: 140 }}
+        />
+        <div style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+          {!isMobile && <button onClick={() => stepMission(-1)} disabled={live} style={sbtn} title="Step back ~15° of orbit">◂ Step</button>}
+          {!isMobile && <button onClick={() => stepMission(1)} disabled={live} style={sbtn} title="Step forward ~15° of orbit">Step ▸</button>}
+          {!isMobile && <button onClick={resetMission} disabled={live} style={sbtn} title="Back to mission start">⟲ Reset</button>}
+          {scrubTime != null && !live && (
+            <button onClick={() => setScrubTime(null)} style={{ ...sbtn, color: "#5eff9c", border: "1px solid rgba(94,255,156,0.5)" }}>↩ Live</button>
+          )}
+          <span style={{ fontSize: 10, color: "#5f7396", minWidth: 40 }}>
+            {live ? "live" : scrubTime != null ? "frozen" : running ? (reverse ? "◀ rev" : "▶ play") : "paused"}
+          </span>
+        </div>
+      </div>
+    );
+  };
+
+  // Attitude Control Display — replaces the Orbit Control Display on the
+  // Satellite 3D view. Switches between "rotation" (design inspection) and
+  // "flight" (real orbital attitude) and toggles the axis triads.
+  const renderAttitudeControlDisplay = () => {
+    const seg = (id, label) => (
+      <button
+        key={id}
+        onClick={() => setSatViewMode(id)}
+        style={{
+          flex: 1, borderRadius: 4, padding: "6px 8px", fontSize: 11, cursor: "pointer",
+          fontFamily: "'IBM Plex Mono',monospace", whiteSpace: "nowrap",
+          background: satViewMode === id ? "rgba(143,215,255,0.2)" : "transparent",
+          border: `1px solid ${satViewMode === id ? "rgba(143,215,255,0.5)" : "rgba(143,215,255,0.2)"}`,
+          color: satViewMode === id ? "#eaf3ff" : "#8fa2c2",
+        }}
+      >
+        {label}
+      </button>
+    );
+    const sub = { fontSize: 10, letterSpacing: 0.5, color: "#5f7396", fontFamily: "system-ui,sans-serif", margin: "6px 0 6px" };
+    return (
+      <div style={{
+        position: "absolute", right: 22, bottom: 64, width: controlsCollapsed ? "auto" : 264,
+        maxHeight: "calc(100% - 86px)", overflowY: "auto",
+        background: "rgba(9,14,28,0.72)", border: "1px solid rgba(143,215,255,0.18)",
+        borderRadius: 6, padding: "12px 16px", backdropFilter: "blur(4px)",
+      }}>
+        <div
+          onClick={() => setControlsCollapsed((c) => !c)}
+          style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 18, cursor: "pointer" }}
+        >
+          <span style={{ fontSize: 11, color: "#7d93b8", fontFamily: "system-ui,sans-serif", letterSpacing: 0.5 }}>ATTITUDE CONTROL DISPLAY</span>
+          <span style={{ fontSize: 12, color: "#8fa2c2" }}>{controlsCollapsed ? "▸" : "▾"}</span>
+        </div>
+        {!controlsCollapsed && (
+          <div style={{ marginTop: 10 }}>
+            <div style={sub}>SPACECRAFT VIEW</div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+              {seg("turntable", "Turntable")}
+              {seg("orbital", "Orbital")}
+              {seg("attitude", "Attitude")}
+            </div>
+            <div style={{ fontSize: 10, color: "#5f7396", marginBottom: 10, lineHeight: 1.4 }}>
+              {satViewMode === "turntable"
+                ? "Turntable spin at the origin — for inspecting the model. Not tied to flight dynamics."
+                : satViewMode === "orbital"
+                  ? "Flying at its real orbital position; body Z→nadir, X→velocity."
+                  : "Attitude sphere around the spacecraft, oriented by the dynamics, above the correct Earth site."}
+            </div>
+
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8fa2c2", marginBottom: 8, cursor: "pointer" }}>
+              <input type="checkbox" checked={showBodyAxes} onChange={(e) => setShowBodyAxes(e.target.checked)} />
+              Enable body axis
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8fa2c2", marginBottom: 8, cursor: "pointer" }}>
+              <input type="checkbox" checked={showInertialAxes} onChange={(e) => setShowInertialAxes(e.target.checked)} />
+              Enable inertial axis
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8fa2c2", marginBottom: 8, cursor: "pointer", opacity: satViewMode === "turntable" ? 0.4 : 1 }}>
+              <input type="checkbox" checked={showSunVector} onChange={(e) => setShowSunVector(e.target.checked)} />
+              Enable Sun vector
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8fa2c2", marginBottom: 10, cursor: "pointer", opacity: satViewMode === "turntable" ? 0.4 : 1 }}>
+              <input type="checkbox" checked={showMagVector} onChange={(e) => setShowMagVector(e.target.checked)} />
+              Enable magnetic vector
+            </label>
+
+            {satViewMode !== "turntable" && (
+              <>
+                <div style={{ display: "flex", justifyContent: "space-between", ...sub, margin: "6px 0 3px" }}>
+                  <span>MODEL SIZE</span><span>{satModelScale.toFixed(2)}×</span>
+                </div>
+                <input type="range" min={0.05} max={1} step={0.01} value={satModelScale}
+                  onChange={(e) => setSatModelScale(Number(e.target.value))} style={{ width: "100%", marginBottom: 6 }} />
+              </>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "space-between", ...sub, margin: "6px 0 3px" }}>
+              <span>ATTITUDE SPHERE SIZE</span><span>{attSphereScale.toFixed(2)}×</span>
+            </div>
+            <input type="range" min={0.3} max={2} step={0.05} value={attSphereScale}
+              onChange={(e) => setAttSphereScale(Number(e.target.value))} style={{ width: "100%", marginBottom: 6 }} />
+
+            <div style={sub}>MODEL</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {SAT_MODELS.map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => setSatModel(m.id)}
+                  style={{
+                    background: satModel === m.id ? "rgba(143,215,255,0.18)" : "transparent",
+                    border: satModel === m.id ? "1px solid rgba(143,215,255,0.45)" : "1px solid rgba(143,215,255,0.2)",
+                    color: satModel === m.id ? "#eaf3ff" : "#8fa2c2",
+                    borderRadius: 4, padding: "5px 9px", fontSize: 11, cursor: "pointer",
+                    fontFamily: "'IBM Plex Mono',monospace", whiteSpace: "nowrap",
+                  }}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div style={{
-      position: "relative", width: "100%", height: "100vh", minHeight: 560,
+      position: "relative", width: "100%", height: "100%", minHeight: isMobile ? 0 : 560,
       background: "radial-gradient(circle at 30% 20%, #0a1226 0%, #05070d 70%)",
       fontFamily: "'IBM Plex Mono','SFMono-Regular',Menlo,monospace",
       color: "#cfe6ff", overflow: "hidden", display: "flex", flexDirection: "column",
     }}>
-      {/* Top bar: always visible across all views */}
+      {/* Top bar: always visible across all views. On mobile it wraps so the
+          tab strip drops to its own full-width, horizontally-scrollable row. */}
       <div style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
-        padding: "14px 22px", borderBottom: "1px solid rgba(143,215,255,0.12)",
+        flexWrap: isMobile ? "wrap" : "nowrap", rowGap: isMobile ? 8 : 0,
+        padding: isMobile ? "9px 12px" : "14px 22px",
+        borderBottom: "1px solid rgba(143,215,255,0.12)",
         background: "rgba(9,14,28,0.6)", zIndex: 2, flexShrink: 0,
       }}>
-        <div>
-          <div style={{ fontFamily: "system-ui,sans-serif", fontSize: 13, letterSpacing: 0.5, color: "#7d93b8" }}>COSMOS WEB</div>
-          <div style={{ fontSize: 18, fontWeight: 600, color: "#eaf3ff" }}>{nodeName}</div>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontFamily: "system-ui,sans-serif", fontSize: isMobile ? 11 : 13, fontWeight: 600, letterSpacing: 0.5, color: "#7d93b8" }}>COSMOS WEB</div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 }}>
+            <span style={{ display: "inline-block", width: 38, fontFamily: "system-ui,sans-serif", fontSize: isMobile ? 8 : 9, letterSpacing: 0.6, color: "#5f7396" }}>NODE</span>
+            <span style={{ fontSize: isMobile ? 10 : 11, fontWeight: 500, color: "#eaf3ff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{nodeName}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 }}>
+            <span style={{ display: "inline-block", width: 38, fontFamily: "system-ui,sans-serif", fontSize: isMobile ? 8 : 9, letterSpacing: 0.6, color: "#5f7396" }}>REALM</span>
+            <span style={{ fontSize: isMobile ? 10 : 11, fontWeight: 500, color: "#8fa2c2", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{realm}</span>
+          </div>
         </div>
 
-        <div style={{ display: "flex", gap: 6 }}>
+        <div style={{
+          display: "flex", gap: 6,
+          order: isMobile ? 3 : 0,
+          flexBasis: isMobile ? "100%" : "auto",
+          overflowX: isMobile ? "auto" : "visible",
+          WebkitOverflowScrolling: "touch",
+        }}>
           {VIEW_TABS.map((tab) => (
             <button
               key={tab.id}
@@ -1182,7 +2047,8 @@ export default function OrbitViewer() {
                 background: activeView === tab.id ? "rgba(143,215,255,0.16)" : "transparent",
                 border: activeView === tab.id ? "1px solid rgba(143,215,255,0.4)" : "1px solid transparent",
                 color: activeView === tab.id ? "#eaf3ff" : "#8fa2c2",
-                borderRadius: 5, padding: "6px 14px", fontSize: 12, cursor: "pointer",
+                borderRadius: 5, padding: isMobile ? "7px 12px" : "6px 14px",
+                fontSize: 12, cursor: "pointer", flexShrink: 0, whiteSpace: "nowrap",
                 fontFamily: "'IBM Plex Mono',monospace",
               }}
             >
@@ -1191,7 +2057,7 @@ export default function OrbitViewer() {
           ))}
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: isMobile ? "auto" : 0 }}>
           <span style={{ width: 8, height: 8, borderRadius: "50%", background: linkColor, boxShadow: `0 0 8px ${linkColor}` }} />
           <span style={{ fontSize: 12, color: linkColor }}>{linkState}</span>
         </div>
@@ -1204,74 +2070,181 @@ export default function OrbitViewer() {
             Three.js scene, camera position, and trail history survive
             switching tabs; just hidden via display when inactive. */}
         <div style={{ position: "absolute", inset: 0, display: activeView === "3d" ? "block" : "none" }}>
-          <div ref={mountRef} style={{ position: "absolute", inset: 0 }} />
+          <div ref={mountRef} style={{ position: "absolute", inset: 0, touchAction: "none" }} />
 
-          {/* Telemetry HUD */}
+          {/* Telemetry HUD — hidden on mobile (the Telemetry tab covers this);
+              collapsible to its header so more of the globe is visible. */}
           <div style={{
-            position: "absolute", left: 22, bottom: 22, width: 240,
+            position: "absolute", left: 22, bottom: 64, width: telemCollapsed ? "auto" : 240,
+            display: isMobile ? "none" : "block",
             background: "rgba(9,14,28,0.72)", border: "1px solid rgba(143,215,255,0.18)",
-            borderRadius: 6, padding: "14px 16px", backdropFilter: "blur(4px)",
+            borderRadius: 6, padding: "12px 16px", backdropFilter: "blur(4px)",
           }}>
-            <div style={{ fontSize: 11, color: "#7d93b8", marginBottom: 8, fontFamily: "system-ui,sans-serif" }}>ECI TELEMETRY</div>
-            <div style={{ display: "grid", gridTemplateColumns: "88px 1fr", rowGap: 4, columnGap: 10 }}>
-              {(() => {
-                const { lat, lon } = eciToLatLon(telem.x, telem.y, telem.z, telem.mjd);
-                return [
-                  ["Satellite", satName],
-                  ["UTC (MJD)", telem.mjd.toFixed(6)],
-                  ["UTC", mjdToISO(telem.mjd)],
-                  ["X (km)", telem.x.toFixed(1)],
-                  ["Y (km)", telem.y.toFixed(1)],
-                  ["Z (km)", telem.z.toFixed(1)],
-                  ["Alt (km)", telem.alt.toFixed(1)],
-                  ["Lat", `${lat.toFixed(3)}°`],
-                  ["Lon", `${lon.toFixed(3)}°`],
-                ];
-              })().map(([label, val]) => (
-                <React.Fragment key={label}>
-                  <span style={{ fontSize: 12, color: "#5f7396", textAlign: "left" }}>{label}</span>
-                  <span style={{ fontSize: 12, color: "#ffb454", textAlign: "left", fontVariantNumeric: "tabular-nums" }}>{val}</span>
-                </React.Fragment>
-              ))}
+            <div
+              onClick={() => setTelemCollapsed((c) => !c)}
+              style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 18, cursor: "pointer" }}
+            >
+              <span style={{ fontSize: 11, color: "#7d93b8", fontFamily: "system-ui,sans-serif", letterSpacing: 0.5 }}>ECI TELEMETRY</span>
+              <span style={{ fontSize: 12, color: "#8fa2c2" }}>{telemCollapsed ? "▸" : "▾"}</span>
             </div>
-            <input
-              value={satName}
-              onChange={(e) => setSatName(e.target.value)}
-              placeholder="Satellite name (from TLE)"
-              style={{ width: "100%", marginTop: 8, background: "#0c1428", border: "1px solid rgba(143,215,255,0.2)", color: "#8fa2c2", borderRadius: 4, padding: "4px 6px", fontSize: 11 }}
-            />
+            {!telemCollapsed && (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "88px 1fr", rowGap: 4, columnGap: 10, marginTop: 8 }}>
+                  {(() => {
+                    const { lat, lon } = eciToLatLon(telem.x, telem.y, telem.z, telem.mjd);
+                    return [
+                      ["Satellite", satName],
+                      ["UTC (MJD)", telem.mjd.toFixed(6)],
+                      ["UTC", mjdToISO(telem.mjd)],
+                      ["MET", fmtDuration(metStartRef.current == null ? 0 : (telem.mjd - metStartRef.current) * 86400)],
+                      ["X (km)", telem.x.toFixed(1)],
+                      ["Y (km)", telem.y.toFixed(1)],
+                      ["Z (km)", telem.z.toFixed(1)],
+                      ["Alt (km)", telem.alt.toFixed(1)],
+                      ["Lat", `${lat.toFixed(3)}°`],
+                      ["Lon", `${lon.toFixed(3)}°`],
+                    ];
+                  })().map(([label, val]) => (
+                    <React.Fragment key={label}>
+                      <span style={{ fontSize: 12, color: "#5f7396", textAlign: "left" }}>{label}</span>
+                      <span style={{ fontSize: 12, color: "#ffb454", textAlign: "left", fontVariantNumeric: "tabular-nums" }}>{val}</span>
+                    </React.Fragment>
+                  ))}
+                </div>
+                <input
+                  value={satName}
+                  onChange={(e) => setSatName(e.target.value)}
+                  placeholder="Satellite name (from TLE)"
+                  style={{ width: "100%", marginTop: 8, background: "#0c1428", border: "1px solid rgba(143,215,255,0.2)", color: "#8fa2c2", borderRadius: 4, padding: "4px 6px", fontSize: 11 }}
+                />
+              </>
+            )}
           </div>
 
-          {/* Controls panel */}
-          <div style={{
-            position: "absolute", right: 22, bottom: 22, width: 280,
-            background: "rgba(9,14,28,0.72)", border: "1px solid rgba(143,215,255,0.18)",
-            borderRadius: 6, padding: "14px 16px", backdropFilter: "blur(4px)",
-          }}>
-            {renderControlsPanelContent(true)}
-          </div>
+          {/* Controls dock (floating panel on desktop, bottom sheet on mobile) */}
+          {renderControlsDock(true, 64)}
+          {renderTimelineBar()}
         </div>
 
         {/* 2D View — Mercator ground-track map */}
         {activeView === "2d" && (
           <div style={{ position: "absolute", inset: 0 }}>
-            <canvas ref={map2dCanvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+            <canvas ref={map2dCanvasRef} style={{ width: "100%", height: "100%", display: "block", touchAction: "none" }} />
             <div style={{
-              position: "absolute", left: 22, top: 16, fontSize: 11, color: "#7d93b8",
+              position: "absolute", left: isMobile ? 10 : 22, top: isMobile ? 10 : 16, right: isMobile ? 10 : "auto",
+              fontSize: isMobile ? 10 : 11, color: "#7d93b8",
               fontFamily: "system-ui,sans-serif", background: "rgba(9,14,28,0.6)",
               padding: "6px 10px", borderRadius: 5,
             }}>
-              Mercator · yellow = current orbit (1.5h) · white dashed = future orbit (1.5h) · shaded = night side + city lights
+              {isMobile
+                ? "Mercator · yellow = orbit · white = +1.5h · shaded = night"
+                : "Mercator · yellow = current orbit (1.5h) · white dashed = future orbit (1.5h) · shaded = night side + city lights"}
             </div>
 
-            {/* Controls panel — same underlying sim/live controls as the 3D view */}
+            {renderControlsDock(false, 64)}
+            {renderTimelineBar()}
+          </div>
+        )}
+
+        {/* Satellite 3D View — close-up render of the spacecraft */}
+        {activeView === "satellite" && (
+          <div style={{ position: "absolute", inset: 0 }}>
+            <div ref={satMountRef} style={{ position: "absolute", inset: 0, touchAction: "none" }} />
+
             <div style={{
-              position: "absolute", right: 22, bottom: 22, width: 280,
-              background: "rgba(9,14,28,0.72)", border: "1px solid rgba(143,215,255,0.18)",
-              borderRadius: 6, padding: "14px 16px", backdropFilter: "blur(4px)",
+              position: "absolute", left: isMobile ? 10 : 22, top: isMobile ? 10 : 16, right: isMobile ? 10 : "auto",
+              fontSize: isMobile ? 10 : 11, color: "#7d93b8",
+              fontFamily: "system-ui,sans-serif", background: "rgba(9,14,28,0.6)",
+              padding: "6px 10px", borderRadius: 5,
             }}>
-              {renderControlsPanelContent(false)}
+              {satName} · {isMobile ? "drag / pinch" : "drag to orbit · scroll to zoom"} ·{" "}
+              {satViewMode === "turntable"
+                ? (linkState === "LIVE" && attitudeRef.current ? "turntable · live attitude" : "turntable · presentation spin")
+                : satViewMode === "orbital"
+                  ? "orbital view · Z→nadir / X→velocity"
+                  : "attitude view · dynamics-driven, over the correct site"}
             </div>
+
+            {/* Spacecraft telemetry readout — hidden on mobile (Telemetry tab
+                covers it); collapsible to its header. */}
+            <div style={{
+              position: "absolute", left: 22, bottom: 64, width: telemCollapsed ? "auto" : 252,
+              maxHeight: "calc(100% - 150px)", overflowY: "auto",
+              display: isMobile ? "none" : "block",
+              background: "rgba(9,14,28,0.72)", border: "1px solid rgba(143,215,255,0.18)",
+              borderRadius: 6, padding: "12px 16px", backdropFilter: "blur(4px)",
+            }}>
+              <div
+                onClick={() => setTelemCollapsed((c) => !c)}
+                style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 18, cursor: "pointer", marginBottom: telemCollapsed ? 0 : 10 }}
+              >
+                <span style={{ fontSize: 11, color: "#7d93b8", fontFamily: "system-ui,sans-serif", letterSpacing: 0.5 }}>ATTITUDE TELEMETRY</span>
+                <span style={{ fontSize: 12, color: "#8fa2c2" }}>{telemCollapsed ? "▸" : "▾"}</span>
+              </div>
+              {!telemCollapsed && (() => {
+                const spd = Math.sqrt(telem.vx ** 2 + telem.vy ** 2 + telem.vz ** 2).toFixed(2);
+                const metSec = metStartRef.current == null ? 0 : (telem.mjd - metStartRef.current) * 86400;
+                const groups = [
+                  { title: "STATE", rows: [
+                    ["Name", satName],
+                    ["Model", SAT_MODELS.find((m) => m.id === satModel).label],
+                    ["Alt (km)", telem.alt.toFixed(1)],
+                    ["Speed", `${spd} km/s`],
+                  ] },
+                  { title: `ATTITUDE · ${satAtt.src}`, rows: [
+                    ["Quat w", satAtt.w.toFixed(4)],
+                    ["Quat x", satAtt.x.toFixed(4)],
+                    ["Quat y", satAtt.y.toFixed(4)],
+                    ["Quat z", satAtt.z.toFixed(4)],
+                    ["Roll", `${satAtt.roll.toFixed(1)}°`],
+                    ["Pitch", `${satAtt.pitch.toFixed(1)}°`],
+                    ["Yaw", `${satAtt.yaw.toFixed(1)}°`],
+                  ] },
+                  ...(satAtt.sun ? [{ title: "SUN VECTOR (body, unit)", rows: [
+                    ["Sx", satAtt.sun.x.toFixed(3)],
+                    ["Sy", satAtt.sun.y.toFixed(3)],
+                    ["Sz", satAtt.sun.z.toFixed(3)],
+                  ] }] : []),
+                  ...(satAtt.mag ? [{ title: "MAG FIELD (body, unit)", rows: [
+                    ["Bx", satAtt.mag.x.toFixed(3)],
+                    ["By", satAtt.mag.y.toFixed(3)],
+                    ["Bz", satAtt.mag.z.toFixed(3)],
+                  ] }] : []),
+                  { title: "TIME", rows: [
+                    ["UTC", mjdToISO(telem.mjd)],
+                    ["MET", fmtDuration(metSec)],
+                  ] },
+                ];
+                return groups.map((g) => (
+                  <div key={g.title} style={{ marginBottom: 10 }}>
+                    <div style={{ fontSize: 10, color: "#5f7396", letterSpacing: 0.5, fontFamily: "system-ui,sans-serif", marginBottom: 4 }}>{g.title}</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "58px 1fr", rowGap: 3, columnGap: 10 }}>
+                      {g.rows.map(([label, val]) => (
+                        <React.Fragment key={label}>
+                          <span style={{ fontSize: 12, color: "#5f7396" }}>{label}</span>
+                          <span style={{ fontSize: 12, color: "#ffb454", fontVariantNumeric: "tabular-nums" }}>{val}</span>
+                        </React.Fragment>
+                      ))}
+                    </div>
+                  </div>
+                ));
+              })()}
+            </div>
+
+            {renderAttitudeControlDisplay()}
+            {renderTimelineBar()}
+          </div>
+        )}
+
+        {/* Space Game — EPET-based training modules */}
+        {activeView === "game" && (
+          <div style={{ position: "absolute", inset: 0 }}>
+            <SpaceGame
+              isMobile={isMobile}
+              satName={satName}
+              onApplyOrbit={(o) => setOrbitEl(o)}
+              onOpenView={(v) => setActiveView(v)}
+            />
           </div>
         )}
 
@@ -1297,15 +2270,15 @@ export default function OrbitViewer() {
             ["Longitude", `${lon.toFixed(4)}°`],
           ];
           return (
-            <div style={{ position: "absolute", inset: 0, overflow: "auto", padding: "32px 22px" }}>
+            <div style={{ position: "absolute", inset: 0, overflow: "auto", padding: isMobile ? "20px 12px" : "32px 22px", WebkitOverflowScrolling: "touch" }}>
               <div style={{ maxWidth: 520, margin: "0 auto" }}>
                 <div style={{ fontSize: 13, color: "#7d93b8", marginBottom: 16, fontFamily: "system-ui,sans-serif" }}>
                   FULL TELEMETRY
                 </div>
                 <div style={{
-                  display: "grid", gridTemplateColumns: "180px 1fr", rowGap: 10, columnGap: 16,
+                  display: "grid", gridTemplateColumns: isMobile ? "115px 1fr" : "180px 1fr", rowGap: 10, columnGap: 16,
                   background: "rgba(9,14,28,0.5)", border: "1px solid rgba(143,215,255,0.15)",
-                  borderRadius: 8, padding: 20,
+                  borderRadius: 8, padding: isMobile ? 14 : 20,
                 }}>
                   {rows.map(([label, val]) => (
                     <React.Fragment key={label}>
@@ -1319,6 +2292,28 @@ export default function OrbitViewer() {
           );
         })()}
 
+        {/* Mission Configurator tab — realm + node */}
+        {activeView === "mission" && (
+          <MissionConfigurator
+            realm={realm} setRealm={setRealm}
+            realms={realms} setRealms={setRealms}
+            nodesByRealm={nodesByRealm} setNodesByRealm={setNodesByRealm}
+            nodeName={nodeName} setNodeName={setNodeName}
+            groundStations={groundStations}
+            isMobile={isMobile}
+          />
+        )}
+
+        {/* Ground Stations tab */}
+        {activeView === "groundstations" && (
+          <GroundStationsView
+            telem={telem}
+            groundStations={groundStations} setGroundStations={setGroundStations}
+            selectedGSId={selectedGSId} setSelectedGSId={setSelectedGSId}
+            isMobile={isMobile}
+          />
+        )}
+
       </div>
 
       <div style={{
@@ -1326,13 +2321,18 @@ export default function OrbitViewer() {
         fontSize: 10, color: "#4a5b7a", letterSpacing: 0.5, flexShrink: 0,
       }}>
         cosmos-web v{COSMOS_WEB_VERSION}
+        {" · "}
+        bridge v{COSMOS_BRIDGE_VERSION}
+        {" · "}
+        <a
+          href="https://github.com/spacemig/cosmosv5-web"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: "#5f7396", textDecoration: "none" }}
+        >
+          github.com/spacemig/cosmosv5-web
+        </a>
       </div>
     </div>
   );
 }
-
-const btnStyle = {
-  flex: 1, background: "rgba(143,215,255,0.1)", border: "1px solid rgba(143,215,255,0.3)",
-  color: "#cfe6ff", borderRadius: 4, padding: "6px 10px", fontSize: 12, cursor: "pointer",
-  fontFamily: "'IBM Plex Mono',monospace",
-};

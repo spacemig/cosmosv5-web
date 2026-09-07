@@ -1,7 +1,7 @@
 {
   "name": "cosmos-web",
   "private": true,
-  "version": "0.2.7",
+  "version": "0.3.0",
   "description": "3D satellite orbit visualizer for COSMOS mission ops, driven by propagatorv3 telemetry.",
   "type": "module",
   "scripts": {

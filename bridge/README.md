@@ -56,7 +56,11 @@ Other environment variables, all optional:
 | `SIMDT`           | `1`                             | Simulation timestep, seconds                  |
 | `RUNCOUNT`        | effectively unlimited            | How many timesteps before propagatorv3 stops  |
 | `UDP_PORT`        | `10031`                         | `CLIENT_PORT_OUT` — propagatorv3's broadcast port |
-| `WS_PORT`         | `8080`                          | WebSocket port the frontend connects to        |
+| `WS_PORT`         | `8080`                          | Port for **both** the WebSocket stream and the `/api/` file API |
+| `COSMOS_ROOT`     | `~/cosmos`                       | Root the file API's `realms`/`nodes` roots hang off |
+| `FS_API`          | `1`                             | Set `0` to disable the realm/node file API entirely |
+| `FS_API_WRITE`    | `1`                             | Set `0` for a read-only file API (browse but not save) |
+| `FS_MAX_READ_BYTES` | `524288`                      | Refuse to serve files larger than this |
 
 ## Running
 
@@ -70,10 +74,33 @@ You should see:
 [cosmos-engine-bridge] launching: /home/pi/cosmos/bin/propagatorv3 '{"postevent":1,...}'
 [cosmos-engine-bridge] listening for propagatorv3 telemetry on UDP 0.0.0.0:10031
 [cosmos-engine-bridge] WebSocket server on ws://0.0.0.0:8080
+[cosmos-engine-bridge] realm/node file API on http://0.0.0.0:8080/api/  (roots: /home/pi/cosmos/realms, /home/pi/cosmos/nodes; writes enabled)
 ```
 
 Then in the cosmos-web UI, set the "Live bridge" field to `ws://<host>:8080` and hit Connect.
 The status indicator should switch from `SIMULATED` to `LIVE`.
+
+## Realm / node file API
+
+The same port also serves a small read/write filesystem API that the cosmos-web **Mission
+Configurator** tab uses to browse and edit real config files. Only two roots are ever exposed —
+`$COSMOS_ROOT/realms` and `$COSMOS_ROOT/nodes` — and any path that resolves outside them is
+refused.
+
+| Method & path | Purpose |
+| ------------- | ------- |
+| `GET /api/health` | `{ ok, roots, write, maxReadBytes }` |
+| `GET /api/tree?root=realms\|nodes` | recursive listing: `{ dir, exists, entries: [{ path, type, size }] }` |
+| `GET /api/file?root=…&path=<rel>` | `{ path, size, mtimeMs, content }` (UTF-8; refused above `FS_MAX_READ_BYTES`) |
+| `PUT /api/file?root=…&path=<rel>` | body `{"content": "..."}` → writes the file (creates parent dirs); needs `FS_API_WRITE=1` |
+
+All responses are JSON with `Access-Control-Allow-Origin: *` so the browser app can call it
+cross-origin. In the Mission Configurator, set **Bridge File Access** to `http://<bridge-host>:8080`
+and hit **Connect**.
+
+This does expose read/write of those two folders to anything on the network that can reach the
+port. On a shared LAN, run with `FS_API_WRITE=0` (read-only) or `FS_API=0` (off), or firewall the
+port.
 
 ## UTC accuracy
 

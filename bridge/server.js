@@ -22,6 +22,7 @@
 
 const dgram = require("dgram");
 const fs = require("fs");
+const http = require("http");
 const satellite = require("satellite.js");
 const { spawn } = require("child_process");
 const path = require("path");
@@ -42,6 +43,12 @@ const CONFIG = {
   UDP_PORT: Number(process.env.UDP_PORT || 10031),
   WS_PORT: Number(process.env.WS_PORT || 8080),
   TLEFILE: process.env.TLEFILE || "tle.dat", // used only for the UTC drift correction below
+
+  // Realm / node file API (served on the same port as the WebSocket).
+  COSMOS_ROOT: process.env.COSMOS_ROOT || path.join(os.homedir(), "cosmos"),
+  FS_API: process.env.FS_API !== "0",              // set FS_API=0 to disable the file API entirely
+  FS_API_WRITE: process.env.FS_API_WRITE !== "0",  // set FS_API_WRITE=0 for read-only
+  FS_MAX_READ_BYTES: Number(process.env.FS_MAX_READ_BYTES || 512 * 1024),
 };
 
 if (!CONFIG.SATFILE) {
@@ -164,9 +171,137 @@ udpSocket.on("error", (err) => {
 udpSocket.bind(CONFIG.UDP_PORT, "0.0.0.0");
 
 // ---------------------------------------------------------------------------
-// 3. WebSocket server — re-emit each telemetry packet to browser clients
+// 3. HTTP + WebSocket server (one port)
 // ---------------------------------------------------------------------------
-const wss = new WebSocket.Server({ port: CONFIG.WS_PORT });
+// ws:// upgrades carry telemetry as before. In addition, a small read/write
+// filesystem API under /api/ lets the cosmos-web Mission Configurator browse
+// and edit realm / node config files. Only two roots are ever exposed
+// (~/cosmos/realms and ~/cosmos/nodes) and path traversal outside them is
+// refused. Disable with FS_API=0, or make it read-only with FS_API_WRITE=0.
+
+const FS_ROOTS = {
+  realms: path.join(CONFIG.COSMOS_ROOT, "realms"),
+  nodes: path.join(CONFIG.COSMOS_ROOT, "nodes"),
+};
+
+function sendJson(res, code, obj) {
+  res.writeHead(code, {
+    "content-type": "application/json",
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET,PUT,OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "cache-control": "no-store",
+  });
+  res.end(JSON.stringify(obj));
+}
+
+// Resolve (rootKey, relPath) to an absolute path, refusing anything that
+// escapes the root directory.
+function resolveSafe(rootKey, relPath) {
+  const rootDir = FS_ROOTS[rootKey];
+  if (!rootDir) return null;
+  const abs = path.resolve(rootDir, "." + path.sep + (relPath || "").replace(/^[/\\]+/, ""));
+  if (abs !== rootDir && !abs.startsWith(rootDir + path.sep)) return null;
+  return { rootDir, abs };
+}
+
+// Bounded recursive directory listing: [{ path, type, size? }, ...].
+function listTree(dir, base = "", depth = 0, out = [], limit = 5000) {
+  if (depth > 8 || out.length >= limit) return out;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return out; }
+  entries.sort((a, b) =>
+    a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1
+  );
+  for (const ent of entries) {
+    if (ent.name.startsWith(".")) continue;
+    const rel = base ? `${base}/${ent.name}` : ent.name;
+    if (ent.isDirectory()) {
+      out.push({ path: rel, type: "dir" });
+      listTree(path.join(dir, ent.name), rel, depth + 1, out, limit);
+    } else if (ent.isFile()) {
+      let size = 0;
+      try { size = fs.statSync(path.join(dir, ent.name)).size; } catch (e) { /* ignore */ }
+      out.push({ path: rel, type: "file", size });
+    }
+  }
+  return out;
+}
+
+function handleApi(req, res) {
+  if (req.method === "OPTIONS") { sendJson(res, 204, {}); return; }
+
+  const u = new URL(req.url, "http://localhost");
+  const route = u.pathname;
+
+  if (route === "/api/health") {
+    sendJson(res, 200, { ok: true, roots: FS_ROOTS, write: CONFIG.FS_API_WRITE, maxReadBytes: CONFIG.FS_MAX_READ_BYTES });
+    return;
+  }
+
+  if (route === "/api/tree") {
+    const rootKey = u.searchParams.get("root");
+    const r = resolveSafe(rootKey, "");
+    if (!r) { sendJson(res, 400, { error: "unknown root (use realms|nodes)" }); return; }
+    const exists = fs.existsSync(r.rootDir);
+    sendJson(res, 200, { root: rootKey, dir: r.rootDir, exists, entries: exists ? listTree(r.rootDir) : [] });
+    return;
+  }
+
+  if (route === "/api/file") {
+    const rootKey = u.searchParams.get("root");
+    const rel = u.searchParams.get("path") || "";
+    const r = resolveSafe(rootKey, rel);
+    if (!r) { sendJson(res, 400, { error: "bad root or path" }); return; }
+
+    if (req.method === "GET") {
+      let st;
+      try { st = fs.statSync(r.abs); } catch (e) { sendJson(res, 404, { error: "not found" }); return; }
+      if (!st.isFile()) { sendJson(res, 400, { error: "not a file" }); return; }
+      if (st.size > CONFIG.FS_MAX_READ_BYTES) { sendJson(res, 413, { error: `file too large (${st.size} bytes)` }); return; }
+      let content;
+      try { content = fs.readFileSync(r.abs, "utf8"); } catch (e) { sendJson(res, 500, { error: e.message }); return; }
+      sendJson(res, 200, { root: rootKey, path: rel, size: st.size, mtimeMs: st.mtimeMs, content });
+      return;
+    }
+
+    if (req.method === "PUT") {
+      if (!CONFIG.FS_API_WRITE) { sendJson(res, 403, { error: "writes disabled (FS_API_WRITE=0)" }); return; }
+      let raw = "";
+      req.setEncoding("utf8");
+      req.on("data", (c) => { raw += c; if (raw.length > 4 * 1024 * 1024) req.destroy(); });
+      req.on("end", () => {
+        let content;
+        try { content = JSON.parse(raw).content; } catch (e) { sendJson(res, 400, { error: "body must be JSON {\"content\": \"...\"}" }); return; }
+        if (typeof content !== "string") { sendJson(res, 400, { error: "content must be a string" }); return; }
+        try {
+          fs.mkdirSync(path.dirname(r.abs), { recursive: true });
+          fs.writeFileSync(r.abs, content, "utf8");
+        } catch (e) { sendJson(res, 500, { error: e.message }); return; }
+        console.log(`[cosmos-engine-bridge] wrote ${r.abs} (${content.length} bytes)`);
+        sendJson(res, 200, { ok: true, root: rootKey, path: rel, bytes: content.length });
+      });
+      return;
+    }
+
+    sendJson(res, 405, { error: "GET or PUT" });
+    return;
+  }
+
+  sendJson(res, 404, { error: "no such route" });
+}
+
+const httpServer = http.createServer((req, res) => {
+  if (CONFIG.FS_API && req.url && req.url.startsWith("/api/")) { handleApi(req, res); return; }
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end(
+    "cosmos-engine-bridge\n" +
+    "  ws://<host>:" + CONFIG.WS_PORT + "   telemetry stream\n" +
+    (CONFIG.FS_API ? "  GET/PUT /api/{health,tree,file}   realm/node file API\n" : "")
+  );
+});
+
+const wss = new WebSocket.Server({ server: httpServer });
 let clientCount = 0;
 
 wss.on("connection", (ws) => {
@@ -178,8 +313,16 @@ wss.on("connection", (ws) => {
   });
 });
 
-console.log(`[cosmos-engine-bridge] WebSocket server on ws://0.0.0.0:${CONFIG.WS_PORT}`);
-console.log(`[cosmos-engine-bridge] point the cosmos-web "Live bridge" field at ws://<this-host>:${CONFIG.WS_PORT}`);
+httpServer.listen(CONFIG.WS_PORT, "0.0.0.0", () => {
+  console.log(`[cosmos-engine-bridge] WebSocket server on ws://0.0.0.0:${CONFIG.WS_PORT}`);
+  if (CONFIG.FS_API) {
+    console.log(
+      `[cosmos-engine-bridge] realm/node file API on http://0.0.0.0:${CONFIG.WS_PORT}/api/  ` +
+      `(roots: ${FS_ROOTS.realms}, ${FS_ROOTS.nodes}; writes ${CONFIG.FS_API_WRITE ? "enabled" : "disabled"})`
+    );
+  }
+  console.log(`[cosmos-engine-bridge] point the cosmos-web "Live bridge" field at ws://<this-host>:${CONFIG.WS_PORT}`);
+});
 
 function broadcastToClients(payload) {
   // Normalize scipos -> ecipos so the frontend doesn't need to know which
@@ -255,7 +398,8 @@ function shutdown() {
   if (sgp4Ticker) clearInterval(sgp4Ticker);
   propagator.kill("SIGTERM");
   udpSocket.close();
-  wss.close(() => process.exit(0));
+  wss.close();
+  httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();
 }
 process.on("SIGINT", shutdown);
