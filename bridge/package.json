@@ -1,0 +1,14 @@
+{
+  "name": "cosmos-engine-bridge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "UDP broadcast -> WebSocket bridge for propagatorv3 telemetry. Prototype location for what will become the standalone cosmos-engine repo.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "satellite.js": "^5.0.0",
+    "ws": "^8.16.0"
+  }
+}

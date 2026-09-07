@@ -4,54 +4,68 @@ A browser-based visualization tool for the [COSMOS](https://github.com/hsfl/cosm
 operations framework. Cosmos Web renders live or simulated satellite orbits in an interactive
 3D globe, and (planned) surfaces which COSMOS agents are currently connected on the network.
 
-This is the successor to `hsfl/cosmos-web` (the earlier Grafana-based telemetry dashboard, now
-archived). For now this repo lives at
-[`spacemig/cosmos-web`](https://github.com/spacemig/cosmos-web) as a private working repo before
-it moves under the `hsfl` org.
+This is the intended successor to `hsfl/cosmos-web` (the earlier Grafana-based telemetry
+dashboard), which will be archived once this project covers what it needs to. For now this repo
+lives at [`spacemig/cosmos-web`](https://github.com/spacemig/cosmos-web) as a private working
+repo before it moves under the `hsfl` org.
 
 The companion backend service — the UDP↔WebSocket bridge that connects this frontend to live
 COSMOS agents — is a separate repo, **`cosmos-engine`** (not yet created).
 
 ## Status
 
-- ✅ 3D orbit viewer (`CosmosOrbitViewer.jsx`) — client-side Keplerian propagator for standalone
+- ✅ 3D orbit viewer (`src/OrbitViewer.jsx`) — client-side Keplerian propagator for standalone
   use, with a WebSocket hook for live telemetry
-- ⏳ `cosmos-engine` bridge service — not yet built. Required to drive the viewer from a real
-  `propagatorv3` process instead of the simulated orbit
+- ✅ Bridge prototype (`bridge/server.js`) — spawns `propagatorv3`, listens for its UDP broadcast
+  telemetry on port `10031`, relays to the browser over WebSocket. Currently lives inside this
+  repo; see Roadmap for splitting it into its own `cosmos-engine` repo
 - ⏳ Agent-discovery panel — not yet built. Will list live COSMOS agents by listening to the
   `225.1.1.1` heartbeat multicast group
 
 ## How it fits into COSMOS
 
 [`propagatorv3`](https://github.com/hsfl/cosmosv5-agent/blob/main/programs/general/propagatorv3.cpp)
-(part of `cosmosv5-agent`) already has a `cosmos_web_addr` output mode designed for a consumer
-like this tool: it streams each simulated node's ECI position/velocity and ICRF attitude as JSON
-over UDP on port `10096` every simulation timestep. Cosmos Engine's orbit viewer is built to
-consume that exact JSON shape:
+(part of `cosmosv5-agent`) can be run with `"postevent":1` in its control JSON, which makes it
+UDP-broadcast one JSON telemetry packet per node per simulation timestep on port `10031`
+(`CLIENT_PORT_OUT`, a plain LAN broadcast — not multicast). That's what `bridge/server.js`
+listens for. Packets look like:
 
 ```json
 {
-  "node": "hiakasat",
+  "mtype": "soh",
   "utc": 60107.512345,
-  "icrfatt": { "w": 0.0, "x": 0.0, "y": 0.0, "z": 1.0 },
-  "ecipos":  { "x": 0.0, "y": 0.0, "z": 0.0 },
-  "lvlhatt": { "...": "..." },
-  "lvlhpos": { "...": "..." }
+  "node": "mother",
+  "ecipos": {
+    "utc": 60107.512345,
+    "s": { "col": [0.0, 0.0, 0.0] },
+    "v": { "col": [0.0, 0.0, 0.0] },
+    "a": { "col": [0.0, 0.0, 0.0] }
+  },
+  "alphaatt": { "w": 0.0, "x": 0.0, "y": 0.0, "z": 1.0 },
+  "powerin": 0.0,
+  "powerout": 0.0,
+  "load": 0.0,
+  "memory": 0.0
 }
 ```
 
+Note the nesting: `ecipos` is `propagatorv3`'s full `cartpos` struct serialized to JSON, not a flat
+`{x,y,z}` — position lives at `ecipos.s.col[0..2]`, in meters.
+
+(Note: `propagatorv3` also has a `cosmos_web_addr` config option that opens telegraf/API sockets
+on ports `10096`/`10097` for a different, database-oriented consumer — but the per-timestep
+telemetry call on that path is commented out in the current source, so it isn't a live signal.
+The `postevent` broadcast above is what this project actually uses.)
+
 `ecipos` is in meters (standard COSMOS/SI convention); the viewer converts to kilometers
-internally. Until `cosmos-engine` exists, the viewer runs a two-body Keplerian propagator
-client-side so it's usable without a live agent.
+internally. Until `propagatorv3` is actually running, the viewer runs a two-body Keplerian
+propagator client-side so it's usable standalone.
 
 ```
-┌────────────────┐      UDP :10096       ┌───────────────────┐      WebSocket      ┌──────────────────────┐
-│  propagatorv3   │ ───────────────────▶ │  cosmos-engine      │ ──────────────────▶ │  cosmos-web (this repo)│
-│  (cosmosv5-agent│   telegraf channel    │  (Node.js, TBD)     │                     │  browser client       │
+┌────────────────┐   UDP :10031 (bcast)   ┌───────────────────┐      WebSocket      ┌──────────────────────┐
+│  propagatorv3   │ ───────────────────▶ │  bridge/server.js   │ ──────────────────▶ │  cosmos-web (this repo)│
+│  (cosmosv5-agent│   postevent packets    │  (Node.js)          │                     │  browser client       │
 └────────────────┘                       └───────────────────┘                     └──────────────────────┘
-                                                    ▲
-                                          UDP :225.1.1.1 (multicast)
-                                          agent heartbeats — TBD panel
 ```
 
 ## Prerequisites
@@ -142,12 +156,14 @@ Point the "Live bridge" field in the UI at a WebSocket URL that re-emits the JSO
 (one message per node per timestep). The viewer switches from `SIMULATED` to `LIVE` on connect
 and drives the satellite marker from real position updates instead of the built-in propagator.
 
-The bridge service (`cosmos-engine` — listening on `propagatorv3`'s UDP telegraf port and
-re-broadcasting to WebSocket clients) is a separate repo and not yet built — see Roadmap.
+The bridge service (`bridge/` in this repo — spawns `propagatorv3`, listens on its UDP broadcast
+port, and re-broadcasts to WebSocket clients) is working as a prototype; see `bridge/README.md`
+for setup. It's expected to move into its own `cosmos-engine` repo eventually — see Roadmap.
 
 ## Roadmap
 
-- [ ] Create `cosmos-engine`: Node.js bridge, UDP `:10096` (telegraf) → WebSocket
+- [x] Bridge prototype: spawn `propagatorv3`, relay UDP `:10031` (postevent broadcast) → WebSocket
+- [ ] Split `bridge/` out into its own `cosmos-engine` repo
 - [ ] `cosmos-engine`: UDP `:225.1.1.1` (agent heartbeat multicast) → REST/WebSocket, for
       an agent-discovery panel in this app (name, node, IP, last-heartbeat age, CPU/memory)
 - [ ] Multi-node support (render more than one satellite at once)
